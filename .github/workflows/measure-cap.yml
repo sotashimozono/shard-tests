@@ -1,0 +1,89 @@
+name: Measure concurrency cap
+
+# Measurement for #4, aimed at the regime that actually motivates #1: what happens
+# once the account's concurrency limit is saturated. Below it, jobs start together
+# and there is nothing to remove — earlier arms confirmed that, peaking at 24
+# simultaneous jobs with a spread of 0–7s.
+#
+# One arm answers both questions at once. Eighty jobs of ten seconds: if the cap is
+# C, roughly C start immediately and the rest begin as earlier ones free a slot, so
+# the sorted start offsets show a staircase whose first step is C and whose height
+# is the stagger. No second arm is needed to find the cap separately.
+#
+# Dispatch only. It saturates the hosted pool for a minute or two, which will delay
+# other hosted jobs on this account while it runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: 'How many jobs to launch at once'
+        required: false
+        default: '80'
+      seconds:
+        description: 'Seconds of work per job'
+        required: false
+        default: '10'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fan:
+    name: 'cap'
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+                21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,
+                61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Work
+        env:
+          SECONDS_OF_WORK: ${{ inputs.seconds }}
+          LIMIT: ${{ inputs.shards }}
+        run: |
+          if [ "${{ matrix.index }}" -gt "$LIMIT" ]; then
+            echo "beyond the requested width, exiting"; exit 0
+          fi
+          sleep "$SECONDS_OF_WORK"
+
+  collect:
+    needs: fan
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Where did the jobs actually start
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GH_REPO}/actions/runs/${RUN}/jobs" \
+            --jq '[.jobs[] | select(.name|startswith("cap")) | {started_at, completed_at}]' \
+            | jq -s 'add' > jobs.json
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, datetime
+          def t(s): return datetime.datetime.fromisoformat(s.replace("Z","+00:00")).timestamp()
+          js=[j for j in json.load(open("jobs.json")) if j["started_at"]]
+          st=sorted(t(j["started_at"]) for j in js)
+          base=st[0]
+          off=[round(s-base) for s in st]
+          print(f"## {len(js)} jobs launched at once\n")
+          print(f"- start spread: **{off[-1]}s**")
+          from collections import Counter
+          c=Counter(off)
+          print(f"- first step: **{c[0]} job(s) started immediately**\n")
+          print("| seconds after the first | jobs starting then | running total |")
+          print("| --- | --- | --- |")
+          tot=0
+          for k in sorted(c):
+              tot+=c[k]
+              print(f"| {k}s | {c[k]} | {tot} |")
+          PY
+      - uses: actions/upload-artifact@v7
+        with: { name: cap-jobs, path: jobs.json }
