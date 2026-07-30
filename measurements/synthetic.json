@@ -1,0 +1,13 @@
+[
+  {
+    "name": "synthetic",
+    "enumerate": "seq -w 1 40 | sed 's/^/unit-/'",
+    "test": "sleep 3",
+    "separator": "\n",
+    "enumerate_needs_build": false,
+    "transfers": [],
+    "timing_mode": "measured",
+    "verified": null,
+    "notes": "Not a real recipe. 40 units of 3s each, so the workload is uniform and known and what is left to vary is the scheduling. Used by the scaling measurement for issue #4; balancing is uninteresting here on purpose, because a suite's own imbalance would be indistinguishable from the effect being measured."
+  }
+]

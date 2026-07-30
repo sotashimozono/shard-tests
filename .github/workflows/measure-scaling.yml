@@ -1,0 +1,144 @@
+name: Measure scaling
+
+# Measurement for #4. Dispatch only — it costs 15 jobs.
+#
+# The question: does wall clock actually fall with shard count on hosted runners,
+# or does the spread in when GitHub starts the jobs of a matrix eat the gain? That
+# spread is the premise the project rests on, so it is measured against a workload
+# chosen to make it visible — 40 units of 3s, uniform, so any imbalance in the
+# result comes from scheduling and not from a suite's own shape.
+#
+# The arms run in sequence, not together. Fifteen jobs queued at once would have
+# each arm waiting on the others, and the stagger of an arm measured under that
+# contention is not the stagger it would see alone.
+#
+# Only the static arm exists today. The claim arms of #4 need #1, and this is
+# shaped so they can be added beside these rather than replacing them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'shard-tests release to measure'
+        required: false
+        default: 'v0.1.7'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  n1:
+    name: 'N=1'
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./measurements/arm
+        with:
+          version: ${{ inputs.version }}
+          shards: '1'
+          index: ${{ matrix.index }}
+
+  n2:
+    name: 'N=2'
+    needs: n1
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./measurements/arm
+        with:
+          version: ${{ inputs.version }}
+          shards: '2'
+          index: ${{ matrix.index }}
+
+  n4:
+    name: 'N=4'
+    needs: n2
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./measurements/arm
+        with:
+          version: ${{ inputs.version }}
+          shards: '4'
+          index: ${{ matrix.index }}
+
+  n8:
+    name: 'N=8'
+    needs: n4
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./measurements/arm
+        with:
+          version: ${{ inputs.version }}
+          shards: '8'
+          index: ${{ matrix.index }}
+
+  collect:
+    name: 'collect'
+    needs: [n1, n2, n4, n8]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read this run's job timings
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GH_REPO}/actions/runs/${RUN}/jobs" \
+            --jq '.jobs[] | select(.name | startswith("N=")) | {name, started_at, completed_at}' \
+            | jq -s '.' > jobs.json
+          jq 'length' jobs.json
+
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, datetime, re
+          jobs = json.load(open("jobs.json"))
+          def t(s): return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+          arms = {}
+          for j in jobs:
+              n = int(re.search(r"N=(\d+)", j["name"]).group(1))
+              arms.setdefault(n, []).append(j)
+
+          print("## Static sharding, 40 uniform units of 3s (120s of work)\n")
+          print("| N | wall clock | start spread | slowest shard | ideal (120/N) |")
+          print("| --- | --- | --- | --- | --- |")
+          for n in sorted(arms):
+              js = arms[n]
+              starts = [t(j["started_at"]) for j in js]
+              ends = [t(j["completed_at"]) for j in js if j["completed_at"]]
+              if not ends:
+                  continue
+              wall = max(ends) - min(starts)
+              spread = max(starts) - min(starts)
+              slowest = max(e - s for s, e in zip(sorted(starts), sorted(ends)))
+              print(f"| {n} | {wall:.0f}s | {spread:.0f}s | {slowest:.0f}s | {120/n:.0f}s |")
+          print()
+          print("`start spread` is the gap between the first and last shard of the arm "
+                "beginning. Where it approaches the ideal per-shard time, adding shards "
+                "stops paying — that is the effect #1 exists to remove.")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: scaling-jobs
+          path: jobs.json
