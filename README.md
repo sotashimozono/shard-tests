@@ -70,6 +70,24 @@ run:       go test $SHARD_TESTS_UNITS
 
 See [`recipes/`](recipes/) for the full set.
 
+## Recipes
+
+A recipe supplies the hooks, the separator, and the properties that decide how the jobs
+have to be assembled. `shard-tests recipes` prints what ships and **where each one was
+actually executed** — only recipes that have been run against a real suite are included,
+because a recipe nobody has run reads as support and behaves as a bug report.
+
+| recipe | units | build first | durations |
+| --- | --- | --- | --- |
+| `vitest` | test files | no — planning runs beside the build | from the runner's report |
+| `cargo-test-binaries` | test binaries | yes | timed per unit by shard-tests |
+
+Anything passed explicitly beats the recipe, so a recipe is a default and not a wall.
+Coverage flags and the like go through `extra`, which reaches the hooks as
+`$SHARD_TESTS_EXTRA` — no rewriting required. Hooks inherit the job's environment, so a
+secret belongs in the step's `env:` and referenced from there, never written into a recipe.
+`--recipe-file` takes a JSON array of your own if none of the built-ins fit.
+
 ## Usage
 
 ```yaml
@@ -80,10 +98,11 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
+      - run: npm ci
       - id: plan
         uses: sotashimozono/shard-tests@v1
         with:
-          enumerate: pytest --collect-only -q | sed '/^$/,$d'
+          recipe: vitest
           target-seconds: 60
           max-shards: 8
       - uses: actions/upload-artifact@v7
@@ -99,13 +118,14 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
+      - run: npm ci
       - uses: actions/download-artifact@v8
         with:
           name: shard-tests-plan
       - uses: sotashimozono/shard-tests/run@v1
         with:
+          recipe: vitest
           index: ${{ matrix.index }}
-          run: pytest $SHARD_TESTS_UNITS
 ```
 
 The plan is a separate job because **GitHub Actions cannot build a dynamic
@@ -141,9 +161,43 @@ and one the plan never predicted is assigned rather than silently skipped — th
 reported as drift. Large drift means the shard count came from a stale total; refresh the
 timings.
 
-Nothing records timings for you yet
-([#3](https://github.com/sotashimozono/shard-tests/issues/3)). `--timings` wants a
-`{"unit id": seconds}` file produced from whatever your runner already reports.
+## Recording durations
+
+Balance needs to know what each unit costs, and the first run cannot. So the first run
+splits by unit count, records what it observed, and every run after that balances on
+measurement.
+
+```yaml
+      - uses: sotashimozono/shard-tests/run@v1
+        with:
+          recipe: vitest
+          index: ${{ matrix.index }}
+          runner: ubuntu-latest
+          timings-out: shard-${{ matrix.index }}.jsonl
+```
+
+then once, after the shards:
+
+```bash
+shard-tests finalize shard-*.jsonl --store timings.jsonl --universe units.txt
+```
+
+and the next `plan` reads it with `--timings timings.jsonl --runner ubuntu-latest`.
+
+The store is **append-only JSONL**, one observation per line, which is why there is no merge
+step to get wrong: N shards each write their own lines and the store is their concatenation.
+Provenance is a field rather than a filename, so one store holds every platform and the
+reader selects — a Windows job can be twice a Linux one, and balancing across both balances
+neither. Keeping the observations rather than a smoothed number means `plan` takes the median
+of the most recent few at read time, so a single cold-cache run does not move the estimate,
+and the policy can change later without the raw numbers having been destroyed. `finalize`
+trims to the last few per unit and drops units no longer in the universe, so a deleted test
+stops counting toward the total that sets the shard count.
+
+Where the store lives between runs is the workflow's business, not this tool's: `--timings`
+takes a path. A cache, an artifact, a committed file, or a git ref all work. A ref has the
+property that a pull request from a fork can read it even though it cannot write — which
+matches trunk being the only thing that should update it.
 
 ## Prior art, honestly
 
