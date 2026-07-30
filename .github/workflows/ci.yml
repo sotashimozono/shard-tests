@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --all-targets
+
+  dogfood:
+    # Shard this crate's own tests with the binary built from this commit, then
+    # assert that the union of what the shards ran is exactly the canonical
+    # universe. Deliberately uses the local binary rather than the published
+    # action, so it works before any release exists.
+    runs-on: ubuntu-latest
+    env:
+      ENUMERATE: |
+        cargo test --quiet -- --list --format terse | sed -n 's/: test$//p'
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+
+      - name: Plan
+        id: plan
+        run: |
+          ./target/release/shard-tests plan \
+            --enumerate "$ENUMERATE" --target-seconds 1 --max-shards 3
+
+      - name: Run every shard
+        env:
+          SHARDS: ${{ steps.plan.outputs.shards }}
+        run: |
+          for i in $(seq 1 "$SHARDS"); do
+            ./target/release/shard-tests run --index "$i" --units-file "ran-$i.txt" \
+              --run 'for u in $SHARD_TESTS_UNITS; do cargo test --quiet -- --exact "$u" > /dev/null; done'
+          done
+
+      - name: Every unit ran exactly once
+        run: |
+          jq -r '.units[].id' shard-tests-plan.json | sort > canonical.txt
+          cat ran-*.txt | sort > ran.txt
+          diff canonical.txt ran.txt

@@ -1,0 +1,108 @@
+name: 'shard-tests plan'
+description: 'Enumerate a test suite and emit a timing-balanced shard matrix'
+author: 'Sota Shimozono'
+branding:
+  icon: 'divide'
+  color: 'purple'
+
+inputs:
+  enumerate:
+    description: 'Shell snippet printing one unit id per line on stdout'
+    required: true
+  prepare:
+    description: 'Shell snippet run once before enumeration (build, archive, codegen)'
+    required: false
+    default: ''
+  timings:
+    description: 'Path to a JSON object mapping unit id to seconds, from a previous run'
+    required: false
+    default: ''
+  target-seconds:
+    description: 'Seconds of test work to aim for per shard, excluding fixed job overhead'
+    required: false
+    default: '60'
+  default-seconds:
+    description: 'Duration assumed for a unit with no recorded timing'
+    required: false
+    default: '1'
+  min-shards:
+    required: false
+    default: '1'
+  max-shards:
+    required: false
+    default: '16'
+  output:
+    description: 'Where to write the plan'
+    required: false
+    default: 'shard-tests-plan.json'
+  version:
+    description: 'shard-tests release to download'
+    required: false
+    default: 'v0.1.0'
+
+outputs:
+  matrix:
+    description: 'JSON for strategy.matrix, e.g. {"index":[1,2,3]}'
+    value: ${{ steps.plan.outputs.matrix }}
+  shards:
+    description: 'Chosen shard count'
+    value: ${{ steps.plan.outputs.shards }}
+  units:
+    description: 'Number of units in the canonical universe'
+    value: ${{ steps.plan.outputs.units }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install shard-tests
+      shell: bash
+      env:
+        ST_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)    target=x86_64-unknown-linux-musl ;;
+          Linux-ARM64)  target=aarch64-unknown-linux-musl ;;
+          macOS-X64)    target=x86_64-apple-darwin ;;
+          macOS-ARM64)  target=aarch64-apple-darwin ;;
+          Windows-X64)  target=x86_64-pc-windows-msvc ;;
+          *) echo "shard-tests: unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        dir="${RUNNER_TEMP}/shard-tests-bin"
+        mkdir -p "$dir"
+        base="https://github.com/sotashimozono/shard-tests/releases/download/${ST_VERSION}"
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          curl -fsSL "${base}/shard-tests-${target}.zip" -o "${dir}/shard-tests.zip"
+          unzip -q -o "${dir}/shard-tests.zip" -d "$dir"
+        else
+          curl -fsSL "${base}/shard-tests-${target}.tar.gz" | tar xz -C "$dir"
+        fi
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: Plan
+      id: plan
+      shell: bash
+      # Recipes arrive through the environment rather than being interpolated into
+      # this script: `${{ inputs.enumerate }}` inline would let a recipe — or
+      # anything that can influence one — run as part of the action itself.
+      env:
+        ST_ENUMERATE: ${{ inputs.enumerate }}
+        ST_PREPARE: ${{ inputs.prepare }}
+        ST_TIMINGS: ${{ inputs.timings }}
+        ST_TARGET: ${{ inputs.target-seconds }}
+        ST_DEFAULT: ${{ inputs.default-seconds }}
+        ST_MIN: ${{ inputs.min-shards }}
+        ST_MAX: ${{ inputs.max-shards }}
+        ST_OUTPUT: ${{ inputs.output }}
+      run: |
+        set -euo pipefail
+        args=(plan
+          --enumerate "$ST_ENUMERATE"
+          --target-seconds "$ST_TARGET"
+          --default-seconds "$ST_DEFAULT"
+          --min-shards "$ST_MIN"
+          --max-shards "$ST_MAX"
+          --output "$ST_OUTPUT")
+        if [ -n "$ST_PREPARE" ]; then args+=(--prepare "$ST_PREPARE"); fi
+        if [ -n "$ST_TIMINGS" ]; then args+=(--timings "$ST_TIMINGS"); fi
+        shard-tests "${args[@]}"

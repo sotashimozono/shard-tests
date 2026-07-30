@@ -1,0 +1,75 @@
+name: 'shard-tests run'
+description: "Run one shard's share of a shard-tests plan"
+author: 'Sota Shimozono'
+branding:
+  icon: 'divide'
+  color: 'purple'
+
+inputs:
+  index:
+    description: '1-based shard index, i.e. the matrix value from the plan job'
+    required: true
+  run:
+    description: 'Shell snippet executed with SHARD_TESTS_UNITS set to this shard''s ids'
+    required: true
+  plan:
+    description: 'Path to the plan written by the plan job'
+    required: false
+    default: 'shard-tests-plan.json'
+  separator:
+    description: 'String joining the unit ids in SHARD_TESTS_UNITS. Defaults to a newline.'
+    required: false
+    default: ''
+  units-file:
+    description: 'Also write the unit ids, one per line, to this path'
+    required: false
+    default: ''
+  version:
+    description: 'shard-tests release to download'
+    required: false
+    default: 'v0.1.0'
+
+runs:
+  using: composite
+  steps:
+    - name: Install shard-tests
+      shell: bash
+      env:
+        ST_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)    target=x86_64-unknown-linux-musl ;;
+          Linux-ARM64)  target=aarch64-unknown-linux-musl ;;
+          macOS-X64)    target=x86_64-apple-darwin ;;
+          macOS-ARM64)  target=aarch64-apple-darwin ;;
+          Windows-X64)  target=x86_64-pc-windows-msvc ;;
+          *) echo "shard-tests: unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        dir="${RUNNER_TEMP}/shard-tests-bin"
+        mkdir -p "$dir"
+        base="https://github.com/sotashimozono/shard-tests/releases/download/${ST_VERSION}"
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          curl -fsSL "${base}/shard-tests-${target}.zip" -o "${dir}/shard-tests.zip"
+          unzip -q -o "${dir}/shard-tests.zip" -d "$dir"
+        else
+          curl -fsSL "${base}/shard-tests-${target}.tar.gz" | tar xz -C "$dir"
+        fi
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: Run shard
+      shell: bash
+      # See the note in the plan action: recipes go through the environment so
+      # they are never interpolated into this script.
+      env:
+        ST_RUN: ${{ inputs.run }}
+        ST_PLAN: ${{ inputs.plan }}
+        ST_INDEX: ${{ inputs.index }}
+        ST_SEPARATOR: ${{ inputs.separator }}
+        ST_UNITS_FILE: ${{ inputs.units-file }}
+      run: |
+        set -euo pipefail
+        args=(run --plan "$ST_PLAN" --index "$ST_INDEX" --run "$ST_RUN")
+        if [ -n "$ST_SEPARATOR" ]; then args+=(--separator "$ST_SEPARATOR"); fi
+        if [ -n "$ST_UNITS_FILE" ]; then args+=(--units-file "$ST_UNITS_FILE"); fi
+        shard-tests "${args[@]}"

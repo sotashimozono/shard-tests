@@ -1,0 +1,21 @@
+[package]
+name = "shard-tests"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "Split any test suite across GitHub Actions runners — timing-balanced, queue-aware."
+repository = "https://github.com/sotashimozono/shard-tests"
+keywords = ["ci", "testing", "sharding", "github-actions"]
+categories = ["command-line-utilities", "development-tools::testing"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
