@@ -1,0 +1,22 @@
+name: 'install shard-tests for measurement'
+description: 'Download a released binary, so the measurement is not dominated by building one'
+
+inputs:
+  version:
+    description: 'Release to download'
+    required: false
+    default: 'v0.1.13'
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ST_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP}/shard-tests-bin"
+        mkdir -p "$dir"
+        curl -fsSL "https://github.com/sotashimozono/shard-tests/releases/download/${ST_VERSION}/shard-tests-x86_64-unknown-linux-musl.tar.gz" \
+          | tar xz -C "$dir"
+        echo "$dir" >> "$GITHUB_PATH"
