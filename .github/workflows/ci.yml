@@ -154,3 +154,82 @@ jobs:
           # Compared numerically, not as a string: jq 1.6 renders 1.0 as "1" while
           # 1.7 keeps "1.0", so a string test passes or fails by runner image.
           jq -e '.measured_fraction == 1' shard-tests-plan.json > /dev/null
+
+  # ── The phase actions, assembled as they are meant to be used ────────────────
+  #
+  # Exercises the artifact handover in particular: an artifact round-trip drops the
+  # executable bit, so a hydrated Rust test binary comes back unrunnable. Nothing
+  # local can catch that — it needs a real upload and download.
+  phases-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+      - uses: ./build
+        with:
+          binary: ./target/release/shard-tests
+          recipe: cargo-test-binaries
+          artifact: phases-build
+
+  phases-organize:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+      - id: plan
+        uses: ./
+        with:
+          binary: ./target/release/shard-tests
+          recipe: cargo-test-binaries
+          target-seconds: '1'
+          max-shards: '2'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: phases-plan
+          path: shard-tests-plan.json
+          retention-days: 1
+
+  phases-test:
+    needs: [phases-build, phases-organize]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.phases-organize.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+      - uses: actions/download-artifact@v8
+        with:
+          name: phases-plan
+      # No local build of the suite: the test binaries can only come from the
+      # artifact, so this fails outright if the handover does not work.
+      - uses: ./run
+        with:
+          binary: ./target/release/shard-tests
+          recipe: cargo-test-binaries
+          index: ${{ matrix.index }}
+          runner: ubuntu-latest
+          build-artifact: phases-build
+          timings-out: shard-${{ matrix.index }}.jsonl
+          timings-artifact-prefix: phases-timings
+
+  phases-finalize:
+    needs: phases-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+      - uses: ./finalize
+        with:
+          binary: ./target/release/shard-tests
+          pattern: phases-timings-*
+          store: timings.jsonl
+          artifact: ''
+      - name: The store came out non-empty
+        run: |
+          test -s timings.jsonl
+          echo "records: $(wc -l < timings.jsonl)"
+          jq -e '.unit and .seconds and .runner == "ubuntu-latest"' timings.jsonl > /dev/null

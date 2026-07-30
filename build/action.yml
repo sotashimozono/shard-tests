@@ -1,0 +1,123 @@
+name: 'shard-tests build'
+description: "Run a recipe's build once and hand the result to the shards"
+author: 'Sota Shimozono'
+branding:
+  icon: 'divide'
+  color: 'purple'
+
+# The build phase as a job of its own. Splitting it out is what lets the plan run
+# beside it rather than after it, and it is the only way to shard a suite whose
+# per-unit invocation is not viable — a Rust workspace, for instance, where running
+# one test through cargo re-resolves features and rebuilds.
+#
+# Environments that cannot be handed over — a docker service, a database, a browser
+# — do not belong here. Each shard brings up its own, which is not a limitation but
+# the reason shards cannot contaminate each other.
+
+inputs:
+  binary:
+    description: >
+      Use this shard-tests binary instead of downloading a release. Lets a repository test the
+      actions against a build of its own, and covers platforms with no published archive.
+    required: false
+    default: ''
+  recipe:
+    description: 'Built-in recipe supplying the build command. `shard-tests recipes` lists them.'
+    required: false
+    default: ''
+  recipe-file:
+    description: 'A JSON array of recipes to look the recipe up in, instead of the built-ins'
+    required: false
+    default: ''
+  build:
+    description: "Build command, overriding the recipe's"
+    required: false
+    default: ''
+  extra:
+    description: 'Passed to the hook as $SHARD_TESTS_EXTRA (feature flags, and the like)'
+    required: false
+    default: ''
+  artifact:
+    description: 'Artifact name the shards download to hydrate'
+    required: false
+    default: 'shard-tests-build'
+  retention-days:
+    description: 'How long to keep the build artifact'
+    required: false
+    default: '1'
+  version:
+    description: 'shard-tests release to download'
+    required: false
+    default: 'v0.1.5'
+
+outputs:
+  transfers:
+    description: 'Paths the shards need, one per line'
+    value: ${{ steps.build.outputs.transfers }}
+  has-transfers:
+    description: 'Whether this recipe hands anything over at all'
+    value: ${{ steps.build.outputs.has-transfers }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install shard-tests
+      shell: bash
+      env:
+        ST_VERSION: ${{ inputs.version }}
+        ST_BINARY: ${{ inputs.binary }}
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP}/shard-tests-bin"
+        mkdir -p "$dir"
+        if [ -n "${ST_BINARY:-}" ]; then
+          cp "$ST_BINARY" "$dir/shard-tests"
+          chmod +x "$dir/shard-tests"
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "shard-tests: using the supplied binary $ST_BINARY"
+          exit 0
+        fi
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)    target=x86_64-unknown-linux-musl ;;
+          Linux-ARM64)  target=aarch64-unknown-linux-musl ;;
+          macOS-X64)    target=x86_64-apple-darwin ;;
+          macOS-ARM64)  target=aarch64-apple-darwin ;;
+          Windows-X64)  target=x86_64-pc-windows-msvc ;;
+          *) echo "shard-tests: unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        base="https://github.com/sotashimozono/shard-tests/releases/download/${ST_VERSION}"
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          curl -fsSL "${base}/shard-tests-${target}.zip" -o "${dir}/shard-tests.zip"
+          unzip -q -o "${dir}/shard-tests.zip" -d "$dir"
+        else
+          curl -fsSL "${base}/shard-tests-${target}.tar.gz" | tar xz -C "$dir"
+        fi
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: Build
+      id: build
+      shell: bash
+      # Through the environment, not interpolated: a command inlined as
+      # `${{ inputs.build }}` would run as part of this action.
+      env:
+        ST_RECIPE: ${{ inputs.recipe }}
+        ST_RECIPE_FILE: ${{ inputs.recipe-file }}
+        ST_BUILD: ${{ inputs.build }}
+        ST_EXTRA: ${{ inputs.extra }}
+      run: |
+        set -euo pipefail
+        args=(build)
+        if [ -n "$ST_RECIPE" ]; then args+=(--recipe "$ST_RECIPE"); fi
+        if [ -n "$ST_RECIPE_FILE" ]; then args+=(--recipe-file "$ST_RECIPE_FILE"); fi
+        if [ -n "$ST_BUILD" ]; then args+=(--build "$ST_BUILD"); fi
+        if [ -n "$ST_EXTRA" ]; then args+=(--extra "$ST_EXTRA"); fi
+        shard-tests "${args[@]}"
+
+    - name: Hand the build over
+      if: steps.build.outputs.has-transfers == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact }}
+        path: ${{ steps.build.outputs.transfers }}
+        retention-days: ${{ inputs.retention-days }}
+        include-hidden-files: true

@@ -155,8 +155,13 @@ pub fn builtin() -> Vec<Recipe> {
             // Run from the package directory, which is where `cargo test` would put
             // the working directory — a test resolving a fixture by relative path
             // fails anywhere else.
+            // `chmod +x` because an artifact round-trip loses the executable bit: the
+            // build phase uploads `target/`, and a hydrated test binary comes back
+            // unrunnable. Doing it here rather than in the action keeps the knowledge
+            // with the recipe that produced the files, and it is harmless when the
+            // build happened in this very job.
             test: r#"awk -F'\t' -v id="$SHARD_TESTS_UNITS" '$1==id{print $2"\t"$3}' shard-tests-map.tsv \
- | while IFS=$'\t' read -r dir exe; do ( cd "$dir" && "$exe" ); done"#
+ | while IFS=$'\t' read -r dir exe; do chmod +x "$exe"; ( cd "$dir" && "$exe" ); done"#
                 .into(),
             report: None,
             separator: "\n".into(),

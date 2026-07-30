@@ -6,6 +6,12 @@ branding:
   color: 'purple'
 
 inputs:
+  binary:
+    description: >
+      Use this shard-tests binary instead of downloading a release. Lets a repository test the
+      actions against a build of its own, and covers platforms with no published archive.
+    required: false
+    default: ''
   recipe:
     description: 'Built-in recipe supplying the hooks. `shard-tests recipes` lists them.'
     required: false
@@ -60,7 +66,7 @@ inputs:
   version:
     description: 'shard-tests release to download'
     required: false
-    default: 'v0.1.4'
+    default: 'v0.1.5'
 
 outputs:
   matrix:
@@ -80,8 +86,18 @@ runs:
       shell: bash
       env:
         ST_VERSION: ${{ inputs.version }}
+        ST_BINARY: ${{ inputs.binary }}
       run: |
         set -euo pipefail
+        dir="${RUNNER_TEMP}/shard-tests-bin"
+        mkdir -p "$dir"
+        if [ -n "${ST_BINARY:-}" ]; then
+          cp "$ST_BINARY" "$dir/shard-tests"
+          chmod +x "$dir/shard-tests"
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "shard-tests: using the supplied binary $ST_BINARY"
+          exit 0
+        fi
         case "${RUNNER_OS}-${RUNNER_ARCH}" in
           Linux-X64)    target=x86_64-unknown-linux-musl ;;
           Linux-ARM64)  target=aarch64-unknown-linux-musl ;;
@@ -90,8 +106,6 @@ runs:
           Windows-X64)  target=x86_64-pc-windows-msvc ;;
           *) echo "shard-tests: unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
         esac
-        dir="${RUNNER_TEMP}/shard-tests-bin"
-        mkdir -p "$dir"
         base="https://github.com/sotashimozono/shard-tests/releases/download/${ST_VERSION}"
         if [ "${RUNNER_OS}" = "Windows" ]; then
           curl -fsSL "${base}/shard-tests-${target}.zip" -o "${dir}/shard-tests.zip"
