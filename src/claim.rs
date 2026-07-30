@@ -17,10 +17,18 @@
 //!
 //! The primitive is git ref creation, which is a compare-and-swap: measured, a
 //! second creation of the same ref loses with 422. It needs `contents: write`,
-//! which a pull request from a fork does not have — so capability is **probed up
-//! front** and the static path taken when it is absent. Discovering it from a 403
-//! in the middle of a run would put a permissions error in the log of the most
-//! common contributor's build.
+//! which a pull request from a fork does not have — so capability is **asked up
+//! front**, by reading the repository's own `permissions.push`, and the static path
+//! taken when it is absent. Discovering it from a 403 in the middle of a run would
+//! put a permissions error in the log of the most common contributor's build.
+//!
+//! Rate limits shape this more than they look like they should. Every shard presents
+//! the same token, so they share one secondary-limit budget of roughly eighty
+//! content-creating requests a minute, and a claim is one create per unit. That is
+//! why the capability question is a read rather than a probe ref — forty shards
+//! writing and deleting a probe each would spend the budget before claiming anything
+//! — and why throttling is backed off and retried rather than allowed to fail a
+//! shard, which would turn a throttle into a red build.
 //!
 //! Batching matters as much as stealing. Claiming one unit at a time would destroy
 //! any runner that parallelises internally, so each round takes
@@ -70,7 +78,33 @@ impl Claimer {
         })
     }
 
+    /// One request, retried while GitHub is asking us to slow down.
+    ///
+    /// Necessary rather than defensive. Every shard presents the same token, so they
+    /// share one secondary-limit budget of roughly eighty content-creating requests a
+    /// minute, and a claim is one create per unit. Forty shards taking forty units sit
+    /// right at it. Without backing off, the shard that hits the limit fails the build
+    /// — turning a throttle into a red run.
     fn api(&self, args: &str) -> Result<(u32, String)> {
+        let mut wait = 2u64;
+        for attempt in 1..=5 {
+            let (code, body) = self.request(args)?;
+            let throttled = (code == 403 || code == 429)
+                && (body.contains("rate limit") || body.contains("abuse"));
+            if !throttled || attempt == 5 {
+                if throttled {
+                    eprintln!("shard-tests: still throttled after {attempt} attempts");
+                }
+                return Ok((code, body));
+            }
+            eprintln!("shard-tests: GitHub is throttling; waiting {wait}s (attempt {attempt}/5)");
+            std::thread::sleep(std::time::Duration::from_secs(wait));
+            wait *= 2;
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    fn request(&self, args: &str) -> Result<(u32, String)> {
         let script = format!(
             r#"token="${{SHARD_TESTS_TOKEN:-$GH_TOKEN}}"
 body=$(mktemp)
@@ -98,19 +132,23 @@ rm -f "$body""#
     ///
     /// Asked once, before any work is assigned, so the absence of the capability is
     /// a mode rather than an error discovered mid-run.
+    ///
+    /// Asked by *reading* the repository's permissions rather than by writing a probe
+    /// ref. GitHub's secondary limit is roughly eighty content-creating requests a
+    /// minute, shared by every shard because they all present the same token — so a
+    /// probe that creates and deletes a ref per shard spends half that budget before
+    /// any work is claimed, and forty shards would exhaust it between them. A read
+    /// costs nothing from that budget.
     pub fn can_claim(&self) -> Result<bool> {
-        let probe = format!("{}/probe", self.namespace);
-        let (code, body) = self.create_ref(&probe)?;
+        let (code, body) = self.api(&format!(r#""https://api.github.com/repos/{}""#, self.repo))?;
         match code {
-            201 => {
-                self.delete_ref(&probe).ok();
-                Ok(true)
+            200 => {
+                let repo: serde_json::Value =
+                    serde_json::from_str(&body).context("the repository response was not JSON")?;
+                Ok(repo["permissions"]["push"].as_bool().unwrap_or(false))
             }
-            // Already there: another shard probed first, which still proves the
-            // capability — the refs exist because somebody could write them.
-            422 => Ok(true),
-            403 | 401 | 404 => Ok(false),
-            _ => bail!("unexpected status {code} probing the claim namespace: {body}"),
+            401 | 403 | 404 => Ok(false),
+            _ => bail!("unexpected status {code} asking what this token may do: {body}"),
         }
     }
 
@@ -184,7 +222,6 @@ impl Claimer {
                 gone += 1;
             }
         }
-        self.delete_ref(&format!("{}/probe", self.namespace)).ok();
         Ok(gone)
     }
 }
