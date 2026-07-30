@@ -15,9 +15,15 @@ jobs:
     # mergeable — that is, before CI has finished, red or not. The required checks
     # configured on `main` are what make enabling it here safe; do not remove them
     # without also removing this.
+    #
+    # Restricted to Dependabot's GitHub Actions updates, matched on the branch
+    # prefix rather than on a label so it cannot be granted by editing labels. A
+    # cargo bump can change what the binary does and gets read by a human; an
+    # Actions bump changes only the CI harness, which the required checks then
+    # exercise in full. The `automerge` label stays as a deliberate manual opt-in.
     runs-on: ubuntu-latest
     if: >
-      github.event.pull_request.user.type == 'Bot' ||
+      startsWith(github.head_ref, 'dependabot/github_actions/') ||
       contains(github.event.pull_request.labels.*.name, 'automerge')
     steps:
       - name: Enable auto-merge

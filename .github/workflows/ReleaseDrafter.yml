@@ -1,0 +1,25 @@
+name: Release Drafter
+
+# Keeps a draft release for the next version, accumulating merged pull requests
+# grouped by label. `Release.yml` adopts that draft when the tag is cut rather
+# than creating a second release for the same tag.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+
+jobs:
+  update_release_draft:
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: release-drafter/release-drafter@v7
+        with:
+          commitish: main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

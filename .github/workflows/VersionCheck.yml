@@ -1,0 +1,82 @@
+name: VersionCheck
+
+# Ensures that every pull request targeting main bumps the Cargo.toml version.
+# Fails if the version on the pull request branch is not strictly greater than
+# the version on the base branch.
+#
+# IMPORTANT: this runs on *every* pull request, not only those touching
+# Cargo.toml. Restricting the trigger with `paths: Cargo.toml` would let
+# bump-forgotten pull requests through silently, because a required check that
+# never runs is treated as skipped rather than as a failure.
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Both branches are needed for the comparison.
+          fetch-depth: 0
+
+      - name: Get base branch version
+        id: base
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          VERSION=$(git show origin/${{ github.base_ref }}:Cargo.toml \
+            | grep -m1 '^version' | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Base version: $VERSION"
+
+      - name: Get pull request branch version
+        id: pr
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "PR version: $VERSION"
+
+      - name: Compare versions (semver)
+        env:
+          BASE: ${{ steps.base.outputs.version }}
+          PR: ${{ steps.pr.outputs.version }}
+        run: |
+          version_gt() {
+            # Returns 0 (success) if $1 > $2 as semver, 1 otherwise.
+            IFS='.' read -r -a A <<< "$1"
+            IFS='.' read -r -a B <<< "$2"
+            for i in 0 1 2; do
+              a="${A[$i]:-0}"
+              b="${B[$i]:-0}"
+              if [ "$a" -gt "$b" ]; then return 0; fi
+              if [ "$a" -lt "$b" ]; then return 1; fi
+            done
+            return 1  # equal is not greater
+          }
+
+          echo "Base: $BASE  →  PR: $PR"
+          if version_gt "$PR" "$BASE"; then
+            echo "✓ Version bumped ($BASE → $PR)"
+          else
+            echo "✗ Version NOT bumped. PR version ($PR) must be strictly greater than base version ($BASE)."
+            exit 1
+          fi
+
+      - name: Cargo.lock agrees with Cargo.toml
+        env:
+          PR: ${{ steps.pr.outputs.version }}
+        run: |
+          # A bump that forgets Cargo.lock leaves the lockfile dirty, which makes
+          # every later `--locked` build fail for a reason unrelated to its change.
+          LOCKED=$(awk '/^name = "shard-tests"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' Cargo.lock)
+          echo "Cargo.toml: $PR   Cargo.lock: $LOCKED"
+          if [ "$PR" != "$LOCKED" ]; then
+            echo "✗ Cargo.lock still records $LOCKED. Run a build and commit the lockfile."
+            exit 1
+          fi
