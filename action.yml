@@ -7,8 +7,16 @@ branding:
 
 inputs:
   enumerate:
-    description: 'Shell snippet printing one unit id per line on stdout'
-    required: true
+    description: 'Shell snippet printing one unit id per line on stdout. Omit when using units-from-timings.'
+    required: false
+    default: ''
+  units-from-timings:
+    description: >
+      Predict the universe from the timings file instead of running a hook, so this job needs
+      no build and can run beside one. Pair with `enumerate` on the run action, which makes
+      real membership authoritative — otherwise a newly added unit is in no shard.
+    required: false
+    default: 'false'
   prepare:
     description: 'Shell snippet run once before enumeration (build, archive, codegen)'
     required: false
@@ -38,7 +46,7 @@ inputs:
   version:
     description: 'shard-tests release to download'
     required: false
-    default: 'v0.1.1'
+    default: 'v0.1.2'
 
 outputs:
   matrix:
@@ -87,6 +95,7 @@ runs:
       # anything that can influence one — run as part of the action itself.
       env:
         ST_ENUMERATE: ${{ inputs.enumerate }}
+        ST_FROM_TIMINGS: ${{ inputs.units-from-timings }}
         ST_PREPARE: ${{ inputs.prepare }}
         ST_TIMINGS: ${{ inputs.timings }}
         ST_TARGET: ${{ inputs.target-seconds }}
@@ -97,12 +106,13 @@ runs:
       run: |
         set -euo pipefail
         args=(plan
-          --enumerate "$ST_ENUMERATE"
           --target-seconds "$ST_TARGET"
           --default-seconds "$ST_DEFAULT"
           --min-shards "$ST_MIN"
           --max-shards "$ST_MAX"
           --output "$ST_OUTPUT")
+        if [ -n "$ST_ENUMERATE" ]; then args+=(--enumerate "$ST_ENUMERATE"); fi
+        if [ "$ST_FROM_TIMINGS" = "true" ]; then args+=(--units-from-timings); fi
         if [ -n "$ST_PREPARE" ]; then args+=(--prepare "$ST_PREPARE"); fi
         if [ -n "$ST_TIMINGS" ]; then args+=(--timings "$ST_TIMINGS"); fi
         shard-tests "${args[@]}"

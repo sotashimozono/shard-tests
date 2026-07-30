@@ -11,23 +11,27 @@ keyed on them.
 Note on YAML: a value containing `: ` must be a block scalar (`|`), otherwise the parser
 reads the colon as a key separator. Most `enumerate` recipes contain one.
 
-## Rust — `cargo nextest`, function-level
+## Rust — function-level
 
-`nextest` can build once and run from an archive, which is what makes the plan job pay for
-itself: the shards reuse its artifact instead of each compiling the suite.
+**Read this one first even if you do not write Rust**: it is where the build is expensive
+enough to change the topology, and the same reasoning applies to Go, Java and C++.
 
-```yaml
-prepare: cargo nextest archive --archive-file target/nextest.tar.zst
-enumerate: |
-  cargo nextest list --archive-file target/nextest.tar.zst --message-format json \
-    | jq -r '."rust-suites" | to_entries[] | .value.testcases | keys[] as $t | "\(.[$t].name)"'
-run: |
-  cargo nextest run --archive-file target/nextest.tar.zst \
-    -E "$(printf 'test(=%s) + ' $SHARD_TESTS_UNITS | sed 's/ + $//')"
-separator: ' '
-```
+### Measured, so you can judge whether it is worth it
 
-Plain `cargo test` works too, at the cost of rebuilding per shard:
+On a real workspace of 799 tests across 47 test binaries, the `cargo test` step was 167s on
+Linux and 309s on Windows, splitting as roughly **92s of compiling and 75s of execution**.
+Two consequences:
+
+- Splitting execution cannot take the job below the compile time. At four shards the Linux
+  job goes 167s → ~111s and stops improving. Know that before adopting.
+- `cargo test` runs test **binaries sequentially** — 47 of them summing 75s. `cargo nextest
+  run` puts every test in one pool across binaries, which on that suite cuts execution to
+  roughly the longest single binary (~21s) **on one machine, with no sharding at all**. Do
+  that first. Sharding is what you reach for when it is not enough.
+
+### Serial: simplest, build in front of the fan-out
+
+Verified against a real suite:
 
 ```yaml
 enumerate: |
@@ -35,6 +39,37 @@ enumerate: |
 run: |
   for u in $SHARD_TESTS_UNITS; do cargo test -- --exact "$u"; done
 ```
+
+Each shard rebuilds. On a public repository that costs no money — only the compile sitting
+in every shard's wall clock.
+
+### Concurrent: build once, transfer it, plan beside it
+
+`nextest` can build to an archive and run from it, so one job compiles and the shards
+hydrate. Planning uses `--units-from-timings`, needs no build, and therefore runs *beside*
+the build rather than in front of it. Each shard then derives membership from its own
+hydrated archive, which is what keeps a newly added test from being lost — see the README
+section on this topology.
+
+```yaml
+# job build
+prepare: cargo nextest archive --archive-file t.tar.zst   # then upload t.tar.zst
+
+# job plan — concurrent with the build
+units-from-timings: true
+timings: prev-timings.json
+
+# each shard — after downloading t.tar.zst
+enumerate: cargo nextest list --archive-file t.tar.zst --message-format json | jq -r '…'
+run: cargo nextest run --archive-file t.tar.zst -E "$SHARD_TESTS_UNITS"
+separator: ' '
+```
+
+> **Unverified:** the `jq` shape for `nextest list --message-format json` is not tested here,
+> and nextest's JSON has changed between versions. Run
+> `cargo nextest list --message-format json | jq 'keys'` against your own version and build
+> the filter from what you see. The `-E` filter expression likewise wants checking against
+> your nextest: `test(=name)` terms joined with `+` is the shape to aim for.
 
 ## Python — `pytest`, node-level
 

@@ -114,6 +114,44 @@ suite size requires it. It also buys two things worth having: enumeration happen
 a divergence between shards cannot hide as a silently missing unit, and a broken recipe
 fails one job instead of N.
 
+## When the build dominates: plan beside it, not in front of it
+
+For a compiled suite, `enumerate` needs the build — which would put the build in front of
+the fan-out. Measured on a Rust workspace of 799 tests, the test job was ~92s of compiling
+and ~75s of execution, so that ordering decides most of the wall clock.
+
+The second topology splits the two apart:
+
+```
+job build:  cargo nextest archive → artifact   ─┐
+                                                ├→ N shards: hydrate, run their slice
+job plan:   shard-tests plan --units-from-timings ┘   ← concurrent with the build
+```
+
+`--units-from-timings` takes the universe from a previous run's measurements, so planning
+needs no build at all. That makes the universe a **prediction** — and a prediction alone
+would put a newly added test in no shard, where it silently never runs. So pair it with
+`run --enumerate`:
+
+```yaml
+      - uses: sotashimozono/shard-tests/run@v1
+        with:
+          index: ${{ matrix.index }}
+          enumerate: cargo nextest list --archive-file t.tar.zst --message-format json | jq -r '…'
+          run: cargo nextest run --archive-file t.tar.zst -E "$SHARD_TESTS_UNITS"
+```
+
+Each shard then derives membership from **its own hydrated build**. Assignment is a
+deterministic function of (universe, durations, shard count), so every shard reaches the
+same partition without talking to any other — a unit runs exactly once, and one the plan
+never predicted is assigned by construction rather than lost. The difference between the
+predicted and the real universe is reported as drift: nothing is dropped, but a large drift
+means the shard count came from a stale total and the timings want refreshing.
+
+Note the honest gap: nothing here records timings for you yet
+([#3](https://github.com/sotashimozono/shard-tests/issues/3)). Until it does, `--timings`
+wants a `{"unit id": seconds}` file you produce from whatever your runner already reports.
+
 ## Prior art, honestly
 
 Static, timing-balanced, file-level splitting is already solved several times over, and

@@ -59,3 +59,51 @@ jobs:
           jq -r '.units[].id' shard-tests-plan.json | sort > canonical.txt
           cat ran-*.txt | sort > ran.txt
           diff canonical.txt ran.txt
+
+  dogfood-derived:
+    # The other topology: plan from timings with no build, then let each shard
+    # derive membership from the real suite. The invariant under test is that
+    # independently-derived slices still partition the REAL universe — including a
+    # unit the plan never predicted, which is simulated by dropping one entry from
+    # the timings file. If this can fail, a newly added test runs twice or never.
+    runs-on: ubuntu-latest
+    env:
+      ENUMERATE: |
+        cargo test --quiet -- --list --format terse | sed -n 's/: test$//p'
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+
+      - name: Record the real universe, and a timings file missing one unit
+        run: |
+          eval "$ENUMERATE" > real.txt
+          wc -l < real.txt
+          head -n -1 real.txt | jq -R -s 'split("\n") | map(select(length > 0)) | map({key: ., value: 3.0}) | from_entries' > timings.json
+          jq 'length' timings.json
+
+      - name: Plan without a build
+        id: plan
+        run: |
+          ./target/release/shard-tests plan \
+            --units-from-timings --timings timings.json --target-seconds 6 --max-shards 4
+
+      - name: Each shard derives its own membership
+        env:
+          SHARDS: ${{ steps.plan.outputs.shards }}
+        run: |
+          for i in $(seq 1 "$SHARDS"); do
+            ./target/release/shard-tests run --index "$i" \
+              --enumerate "$ENUMERATE" --units-file "derived-$i.txt" --run 'true'
+          done
+
+      - name: The derived slices partition the real universe exactly
+        run: |
+          sort real.txt > want.txt
+          cat derived-*.txt | sort > got.txt
+          diff want.txt got.txt
+          # And the unpredicted unit is owned by exactly one shard, not zero, not two.
+          # `grep -l` rather than `grep -c`: with a single shard file `-c` prints a bare
+          # count with no `file:` prefix, so a filter on that prefix would read as zero.
+          owners=$(grep -l -x -F "$(tail -1 real.txt)" derived-*.txt | wc -l)
+          echo "unpredicted unit is owned by $owners shard(s)"
+          test "$owners" = "1"
