@@ -11,64 +11,108 @@ only state it keeps lives in your own repository.
 
 [limits]: https://docs.github.com/actions/reference/limits
 
-## Status
-
-**v0.1 — the static path works.** `plan` + `run` split any suite by measured per-unit
-time, on any language, and that alone is a complete tool.
-
-**Claim-time assignment is not implemented yet** ([#1](https://github.com/sotashimozono/shard-tests/issues/1)).
-That is the part this project exists for, and it is deliberately not faked: until it
-lands, `shard-tests` is a static splitter and says so.
-
 ## The idea
 
-GitHub does not start the jobs of a matrix at the same time. Measured on hosted runners,
-the spread between the first and last job of one matrix reached **4s to 199s**. Static
-splitting — every existing tool in this space, and every native `--shard` flag — hands
-each shard an equal share as though all of them began at once. Wall clock becomes
+**Once an account's concurrency allowance is saturated, GitHub cannot start the jobs of a
+matrix together** — a job begins when an earlier one frees a slot. Static splitting, which
+is every existing tool in this space and every native `--shard` flag, hands each shard an
+equal share as though all of them began at once. Wall clock becomes
 
 ```
 max(start delay)  +  total / N
 ```
 
-and when the suite is fast the stagger dominates completely. Adding shards makes it
-worse, because each new shard pays fixed job overhead and is exposed to the same stagger.
+so past the ceiling, adding shards makes things *worse*: each new shard gets a smaller
+share of the work and waits longer to begin.
 
-If a shard instead takes its next unit **at the moment it is free**, a late-starting shard
-simply takes fewer units, or none. Shard count above the useful minimum stops being a
-penalty. And when minutes are free — as they are for public repositories — that is the
-whole game: **you can over-provision, and over-provisioning is only safe under
-claim-time assignment.**
+Measured here, with a uniform synthetic workload on `ubuntu-latest`:
 
-## Three hooks, any language
+| | start spread |
+| --- | --- |
+| below the ceiling (≤24 jobs) | **0–7s** — they do start together, and there is nothing to win |
+| 80 jobs launched at once | **37s**, arriving in steps on the job-duration period |
 
-The binary knows nothing about any test framework. A recipe supplies three shell snippets,
-and **the unit of sharding is whatever `enumerate` prints** — a file, a test function, a
-package, a test set. That is what lets file-per-unit, function-per-unit and
-package-per-unit ecosystems share one implementation.
+Effective ceiling on the account measured: **~31 concurrent**. For a 120s suite with the
+measured ~5s of per-job overhead:
+
+| | wall clock |
+| --- | --- |
+| static, N=8 | 26s |
+| static, N=30 | 16s |
+| static, N=80 | **44s** — worse than N=8 |
+| claim, N=80 | **~10s** |
+
+If a shard instead takes its next units **at the moment it is free**, a late-starting shard
+takes fewer, or none. The sharp form of the argument is not that claiming recovers the
+stagger — it is that **the best static shard count is the ceiling, and the ceiling is not
+knowable from a workflow file.** It moves with the plan, the runner type, and whatever else
+the account is running. Claiming means not needing to know it.
+
+And when minutes are free, as they are for public repositories, that is the whole game:
+**you can over-provision, and over-provisioning is only safe under claim-time assignment.**
+
+Below the ceiling none of this matters, and the static path is the right tool. Both ship.
+
+## Claiming
+
+```yaml
+      - uses: sotashimozono/shard-tests/run@v1
+        with:
+          recipe: vitest
+          index: ${{ matrix.index }}
+          claim: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+with `permissions: contents: write` on the job, and once after the shards:
+
+```yaml
+      - uses: sotashimozono/shard-tests/finalize@v1
+        with:
+          drop-claims: ${{ github.run_id }}
+```
+
+A shard takes `ceil(remaining / shards)` units per round — large while the queue is full,
+small as it drains. Not one at a time, which would serialise any runner that parallelises
+internally; not all at once, which is static splitting with extra steps.
+
+The primitive is git ref creation under `refs/kleroterion/<run>/`, which is a
+compare-and-swap: the second creation of a ref loses with 422, so exactly one shard owns a
+unit without any of them coordinating.
+
+**A pull request from a fork cannot claim** — its token cannot write `contents`. The
+capability is probed once before any work is assigned, and the shard runs its static slice
+instead, with a line saying so. That is a mode rather than a fallback: it is most of the
+traffic on a public repository, and it still gets a *balanced* split, because reading the
+timings store needs no write access.
+
+`finalize --drop-claims` releases the refs. Nothing else removes them, so without it the
+namespace grows by a ref per unit per run, forever.
+
+## Four hooks, any language
+
+The binary knows nothing about any test framework. A recipe supplies the hooks, and **the
+unit of sharding is whatever `enumerate` prints** — a file, a test function, a package, a
+test binary. That is what lets file-per-unit, function-per-unit and binary-per-unit
+ecosystems share one implementation.
 
 | hook | when | why |
 | --- | --- | --- |
-| `prepare` | once, in the plan job | compiled languages cannot list tests without building; the artifact it leaves is what shards reuse instead of each building their own |
-| `enumerate` | once, in the plan job | prints one stable unit id per line |
-| `run` | per shard | receives its ids in `$SHARD_TESTS_UNITS` |
+| `build` | once | compiled languages cannot list tests without building; what it leaves behind is what the shards hydrate instead of each building their own |
+| `enumerate` | once, or per shard | prints one stable unit id per line |
+| `test` | per shard | receives its ids in `$SHARD_TESTS_UNITS` |
+| `report` | per shard | turns the runner's own output into `unit<TAB>seconds`, so the next run balances on measurement |
 
 ```
-# Rust
-prepare:   cargo nextest archive --archive-file target/nextest.tar.zst
-enumerate: cargo nextest list --archive-file target/nextest.tar.zst --message-format json | jq -r '...'
-run:       cargo nextest run --archive-file target/nextest.tar.zst -E "$SHARD_TESTS_UNITS"
-
-# Python
-enumerate: pytest --collect-only -q | sed '/^$/,$d'
-run:       pytest $SHARD_TESTS_UNITS
-
-# Go
-enumerate: go list ./...
-run:       go test $SHARD_TESTS_UNITS
+# what the built-in `vitest` recipe is, in full
+enumerate: npx vitest list --filesOnly
+test:      npx vitest run $SHARD_TESTS_UNITS --reporter=json --outputFile="$SHARD_TESTS_REPORT"
+report:    jq -r '…' "$SHARD_TESTS_REPORT"      # -> tests/Foo.test.ts<TAB>0.44
 ```
 
-See [`recipes/`](recipes/) for the full set.
+`shard-tests recipes` prints the built-ins in full, including where each was verified. See
+[`recipes/`](recipes/) for writing your own.
 
 ## Recipes
 
