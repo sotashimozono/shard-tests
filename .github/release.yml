@@ -1,0 +1,26 @@
+# Categories for GitHub's automatic release notes, which `Release.yml` generates.
+#
+# Replaces a Release Drafter config that did the same thing: keeping a draft in
+# parallel with a workflow that publishes releases means two writers for one tag,
+# and they race on the same push.
+changelog:
+  exclude:
+    labels:
+      - dependencies
+  categories:
+    - title: 💥 Breaking changes
+      labels: [breaking]
+    - title: 🚀 Features
+      labels: [enhancement, feature]
+    - title: 🐛 Bug Fixes
+      labels: [bug, fix]
+    - title: ⚡ Performance
+      labels: [performance]
+    - title: 🧪 Recipes
+      labels: [recipe]
+    - title: 📖 Documentation
+      labels: [documentation]
+    - title: 🧰 Maintenance
+      labels: [chore, refactor]
+    - title: Other changes
+      labels: ["*"]

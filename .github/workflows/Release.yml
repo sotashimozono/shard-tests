@@ -66,23 +66,27 @@ jobs:
     if: needs.tag.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Create the release, or adopt the draft Release Drafter left
+      - name: Create or refresh the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          # Release Drafter keeps a draft whose tag is the next resolved version.
-          # Creating a second release for that same tag is the collision this
-          # ordering exists to avoid, so adopt the draft instead — and do not pass
-          # --notes, which would discard the changelog it accumulated.
+          # Notes come from GitHub's own generation, categorised by `.github/release.yml`.
+          #
+          # This used to adopt a Release Drafter draft instead, which produced two
+          # releases sharing one tag: both workflows fire on the same push and race,
+          # and Release Drafter only ever *updates* a draft — finding a published
+          # release for its version, it creates another draft beside it. Generating
+          # the notes here removes the second writer rather than sequencing it.
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TAG" --draft=false
-            echo "adopted the existing release for $TAG"
+            gh api "repos/${GH_REPO}/releases/generate-notes" -f tag_name="$TAG" --jq .body > notes.md
+            gh release edit "$TAG" --title "$TAG" --notes-file notes.md --draft=false
+            echo "refreshed $TAG"
           else
             gh release create "$TAG" --title "$TAG" --generate-notes
-            echo "created $TAG with generated notes"
+            echo "created $TAG"
           fi
 
   upload:
