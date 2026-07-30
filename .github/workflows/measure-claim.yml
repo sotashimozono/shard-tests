@@ -12,6 +12,13 @@ name: Measure claim vs static
 # The arms run in sequence. Run together they would each be waiting on the other's
 # jobs, and neither number would mean anything.
 #
+# The binary is downloaded, not built. A first run built it in each job, and the
+# ~30s that cost dominated everything: 80 jobs cycling through a ceiling of 31 takes
+# three waves of 30s whatever the assignment policy, so static came out at 108s and
+# claiming at 96s and the comparison measured cargo rather than scheduling. That
+# result is worth keeping — it says over-provisioning is wasteful under *either*
+# policy when the per-job fixed cost is large — but it is not this experiment.
+#
 # Dispatch only: 160 jobs, and it saturates the hosted pool for a few minutes.
 
 on:
@@ -31,13 +38,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: cargo build --release
+      - uses: ./measurements/install
       - name: Plan and run a fixed slice
         run: |
-          ./target/release/shard-tests plan \
+          shard-tests plan \
             --recipe synthetic --recipe-file measurements/synthetic.json \
             --min-shards 80 --max-shards 80
-          ./target/release/shard-tests run \
+          shard-tests run \
             --recipe synthetic --recipe-file measurements/synthetic.json \
             --index ${{ matrix.index }}
 
@@ -51,15 +58,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: cargo build --release
+      - uses: ./measurements/install
       - name: Plan and take work when free
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ./target/release/shard-tests plan \
+          shard-tests plan \
             --recipe synthetic --recipe-file measurements/synthetic.json \
             --min-shards 80 --max-shards 80
-          ./target/release/shard-tests run --claim \
+          shard-tests run --claim \
             --recipe synthetic --recipe-file measurements/synthetic.json \
             --index ${{ matrix.index }} --runner ubuntu-latest
 
