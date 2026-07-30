@@ -1,11 +1,21 @@
-//! The plan phase: enumerate the canonical unit universe, choose a shard count,
-//! and emit both a claim order and a static assignment.
+//! The plan phase: establish the unit universe, choose a shard count, and emit
+//! both a claim order and a static assignment.
 //!
-//! Everything downstream keys off the plan, so it is produced exactly once per
-//! workflow run. Enumerating independently in every shard would be cheaper in
-//! wall clock but would make a divergence between shards invisible — a unit that
-//! silently fails to appear in one shard is indistinguishable from a unit that
-//! does not exist. One enumeration means completeness is checkable.
+//! There are two ways to get the universe, and they trade different things.
+//!
+//! `--enumerate` runs a hook here, so the plan is authoritative about which units
+//! exist and completeness is checkable against one list. The cost is ordering: for
+//! a compiled suite the hook needs the build, which puts the build in front of the
+//! fan-out.
+//!
+//! `--units-from-timings` predicts the universe from a previous run's measurements
+//! and needs no build, so planning runs *beside* one. The universe is then only a
+//! prediction, and a prediction alone would lose a newly added test silently — so
+//! this mode is meant to be paired with `run --enumerate`, where each shard derives
+//! real membership from its own hydrated build. Assignment is a deterministic
+//! function of (universe, durations, shard count), so the shards agree on the
+//! partition without coordinating, and the plan's universe is demoted to a baseline
+//! that drift is reported against.
 
 use crate::hook;
 use anyhow::{bail, Context, Result};
@@ -30,7 +40,16 @@ pub struct PlanArgs {
     /// a package, a test set. Ids must be stable across runs, because recorded
     /// timings are keyed on them.
     #[arg(long)]
-    enumerate: String,
+    enumerate: Option<String>,
+
+    /// Take the universe to be the keys of the timings file instead of running a
+    /// hook, so planning needs no build and can run beside one.
+    ///
+    /// The universe is then a *prediction* of what the build will contain. Pair it
+    /// with `run --enumerate`, which derives real membership from the built
+    /// artifact — otherwise a newly added test is in no shard and never runs.
+    #[arg(long, conflicts_with = "enumerate")]
+    units_from_timings: bool,
 
     /// JSON object mapping unit id to seconds, recorded by a previous run.
     #[arg(long)]
@@ -86,6 +105,17 @@ pub struct Plan {
     /// Shard index to unit indices. Used directly when claiming is unavailable —
     /// notably on pull requests from forks, where the job has no write token.
     pub assignment: Vec<Vec<usize>>,
+
+    /// Duration assumed for a unit with no recorded timing.
+    ///
+    /// Carried in the artifact so a shard re-deriving membership from the real
+    /// build applies the same fallback, and therefore reaches the same partition.
+    #[serde(default = "one_second")]
+    pub default_seconds: f64,
+}
+
+fn one_second() -> f64 {
+    1.0
 }
 
 impl Plan {
@@ -114,29 +144,32 @@ pub fn main(args: PlanArgs) -> Result<()> {
         hook::status(prepare, &[])?;
     }
 
-    eprintln!("shard-tests: enumerate");
-    let ids = parse_units(&hook::capture(&args.enumerate, &[])?)?;
-
     let timings = match &args.timings {
         Some(path) => load_timings(path)?,
         None => Default::default(),
     };
 
-    let units: Vec<Unit> = ids
-        .into_iter()
-        .map(|id| match timings.get(&id) {
-            Some(&seconds) => Unit {
-                id,
-                seconds,
-                measured: true,
-            },
-            None => Unit {
-                id,
-                seconds: args.default_seconds,
-                measured: false,
-            },
-        })
-        .collect();
+    let ids = match (&args.enumerate, args.units_from_timings) {
+        (Some(hook), false) => {
+            eprintln!("shard-tests: enumerate");
+            parse_units(&hook::capture(hook, &[])?)?
+        }
+        (None, true) => {
+            if timings.is_empty() {
+                bail!("--units-from-timings needs --timings, and that file must not be empty");
+            }
+            let ids = universe_from_timings(&timings);
+            eprintln!(
+                "shard-tests: universe predicted from {} timing entries",
+                ids.len()
+            );
+            ids
+        }
+        (None, false) => bail!("pass either --enumerate or --units-from-timings"),
+        (Some(_), true) => unreachable!("clap rejects both"),
+    };
+
+    let units = build_units(&ids, &timings, args.default_seconds);
 
     let total_seconds: f64 = units.iter().map(|u| u.seconds).sum();
     let measured_seconds: f64 = units.iter().filter(|u| u.measured).map(|u| u.seconds).sum();
@@ -164,6 +197,7 @@ pub fn main(args: PlanArgs) -> Result<()> {
         total_seconds,
         measured_fraction,
         assignment,
+        default_seconds: args.default_seconds,
     };
 
     let json = serde_json::to_string_pretty(&plan)?;
@@ -220,7 +254,7 @@ pub fn main(args: PlanArgs) -> Result<()> {
 /// A duplicate id would break identity: two distinct units sharing a key means
 /// timings collide and "did every unit run exactly once" stops being answerable.
 /// Failing here is much cheaper than a silently mis-balanced suite.
-fn parse_units(raw: &str) -> Result<Vec<String>> {
+pub fn parse_units(raw: &str) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
     for line in raw.lines() {
@@ -239,6 +273,43 @@ fn parse_units(raw: &str) -> Result<Vec<String>> {
     Ok(ids)
 }
 
+/// The predicted universe: the timing file's keys, sorted.
+///
+/// Sorted deliberately. A `HashMap`'s iteration order is not stable between
+/// processes, and enumeration order is what breaks ties between equal-duration
+/// units — leaving it unsorted would let two shards deriving from the same file
+/// disagree about the partition, which is exactly-once quietly broken.
+pub fn universe_from_timings(timings: &std::collections::HashMap<String, f64>) -> Vec<String> {
+    let mut ids: Vec<String> = timings.keys().cloned().collect();
+    ids.sort();
+    ids
+}
+
+/// Attaches a duration to each id, falling back to `default_seconds`.
+///
+/// Shared with `run`, which re-derives the partition from the real build: the two
+/// only agree if they attach durations the same way.
+pub fn build_units(
+    ids: &[String],
+    timings: &std::collections::HashMap<String, f64>,
+    default_seconds: f64,
+) -> Vec<Unit> {
+    ids.iter()
+        .map(|id| match timings.get(id) {
+            Some(&seconds) => Unit {
+                id: id.clone(),
+                seconds,
+                measured: true,
+            },
+            None => Unit {
+                id: id.clone(),
+                seconds: default_seconds,
+                measured: false,
+            },
+        })
+        .collect()
+}
+
 fn load_timings(path: &Path) -> Result<std::collections::HashMap<String, f64>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("could not read timings {}", path.display()))?;
@@ -252,7 +323,7 @@ fn load_timings(path: &Path) -> Result<std::collections::HashMap<String, f64>> {
 
 /// Longest-processing-time-first, ties broken by enumeration order so the result
 /// is a deterministic function of the plan inputs.
-fn lpt_order(units: &[Unit]) -> Vec<usize> {
+pub fn lpt_order(units: &[Unit]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..units.len()).collect();
     order.sort_by(|&a, &b| {
         units[b]
@@ -279,7 +350,7 @@ fn choose_shards(total_seconds: f64, target: f64, min: usize, max: usize) -> usi
 }
 
 /// Greedy LPT bin packing: each unit goes to the least loaded shard.
-fn assign(units: &[Unit], order: &[usize], shards: usize) -> Vec<Vec<usize>> {
+pub fn assign(units: &[Unit], order: &[usize], shards: usize) -> Vec<Vec<usize>> {
     let mut load = vec![0.0f64; shards];
     let mut assignment = vec![Vec::new(); shards];
     for &unit in order {
@@ -438,5 +509,109 @@ mod tests {
         let assignment = assign(&units, &order, 5);
         assert_eq!(assignment.len(), 5);
         assert_eq!(assignment.iter().filter(|s| s.is_empty()).count(), 3);
+    }
+
+    // ── Membership derived per shard, as `run --enumerate` does ──────────────────
+
+    type Timings = std::collections::HashMap<String, f64>;
+
+    fn timings_of(pairs: &[(&str, f64)]) -> Timings {
+        pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect()
+    }
+
+    /// Mirrors what a single shard computes on its own: no plan slice, no peers.
+    fn derive(
+        real: &[String],
+        t: &Timings,
+        default: f64,
+        shards: usize,
+        index: usize,
+    ) -> Vec<String> {
+        let units = build_units(real, t, default);
+        let order = lpt_order(&units);
+        let assignment = assign(&units, &order, shards);
+        assignment[index - 1]
+            .iter()
+            .map(|&i| units[i].id.clone())
+            .collect()
+    }
+
+    fn real_universe() -> Vec<String> {
+        ["a", "b", "c", "d", "e", "f", "g", "brand_new"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn independently_derived_shards_partition_the_real_universe() {
+        // The property the whole scheme rests on: each shard derives its own slice
+        // from the same universe with no coordination, and the slices still form an
+        // exact partition. If this can fail, a unit either runs twice or not at all.
+        let real = real_universe();
+        let t = timings_of(&[
+            ("a", 30.0),
+            ("b", 25.0),
+            ("c", 10.0),
+            ("d", 8.0),
+            ("e", 2.0),
+        ]);
+
+        for shards in 1..=6 {
+            let mut seen: Vec<String> = (1..=shards)
+                .flat_map(|i| derive(&real, &t, 1.0, shards, i))
+                .collect();
+            seen.sort();
+            let mut want = real.clone();
+            want.sort();
+            assert_eq!(seen, want, "shards={shards} did not partition the universe");
+        }
+    }
+
+    #[test]
+    fn derivation_does_not_depend_on_the_timings_map_order() {
+        // A HashMap does not iterate in a stable order between processes. Two shards
+        // reading the same timings must still agree, so nothing may depend on that
+        // order — this fails the moment a lookup is replaced by an iteration.
+        let real = real_universe();
+        let forward = timings_of(&[("a", 30.0), ("b", 25.0), ("c", 10.0), ("d", 8.0)]);
+        let mut backward = Timings::new();
+        for (k, v) in [("d", 8.0), ("c", 10.0), ("b", 25.0), ("a", 30.0)] {
+            backward.insert(k.to_string(), v);
+        }
+        for i in 1..=3 {
+            assert_eq!(
+                derive(&real, &forward, 1.0, 3, i),
+                derive(&real, &backward, 1.0, 3, i),
+                "shard {i} disagreed depending on insertion order"
+            );
+        }
+    }
+
+    #[test]
+    fn universe_from_timings_is_insertion_order_independent() {
+        let a = timings_of(&[("z", 1.0), ("a", 2.0), ("m", 3.0)]);
+        let mut b = Timings::new();
+        for (k, v) in [("m", 3.0), ("z", 1.0), ("a", 2.0)] {
+            b.insert(k.to_string(), v);
+        }
+        assert_eq!(universe_from_timings(&a), universe_from_timings(&b));
+        assert_eq!(universe_from_timings(&a), vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn a_unit_the_plan_never_predicted_is_still_assigned() {
+        // The reason drift is a report and not a repair: membership comes from the
+        // real universe, so an added test lands in some shard by construction.
+        let real = real_universe();
+        let t = timings_of(&[("a", 30.0)]);
+        let owners: Vec<usize> = (1..=4)
+            .filter(|&i| derive(&real, &t, 1.0, 4, i).contains(&"brand_new".to_string()))
+            .collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "brand_new must be owned by exactly one shard"
+        );
     }
 }

@@ -12,6 +12,18 @@ inputs:
   run:
     description: 'Shell snippet executed with SHARD_TESTS_UNITS set to this shard''s ids'
     required: true
+  enumerate:
+    description: >
+      Shell snippet printing one unit id per line, evaluated in this shard. Give this when the
+      plan was made with units-from-timings: it makes real membership authoritative, so a unit
+      the plan did not predict is still assigned rather than silently skipped. Must be cheap —
+      listing from a hydrated build artifact qualifies, compiling the suite again does not.
+    required: false
+    default: ''
+  fail-on-drift:
+    description: 'Treat any difference between the predicted and real universe as an error'
+    required: false
+    default: 'false'
   plan:
     description: 'Path to the plan written by the plan job'
     required: false
@@ -27,7 +39,7 @@ inputs:
   version:
     description: 'shard-tests release to download'
     required: false
-    default: 'v0.1.1'
+    default: 'v0.1.2'
 
 runs:
   using: composite
@@ -65,11 +77,15 @@ runs:
         ST_RUN: ${{ inputs.run }}
         ST_PLAN: ${{ inputs.plan }}
         ST_INDEX: ${{ inputs.index }}
+        ST_ENUMERATE: ${{ inputs.enumerate }}
+        ST_FAIL_ON_DRIFT: ${{ inputs.fail-on-drift }}
         ST_SEPARATOR: ${{ inputs.separator }}
         ST_UNITS_FILE: ${{ inputs.units-file }}
       run: |
         set -euo pipefail
         args=(run --plan "$ST_PLAN" --index "$ST_INDEX" --run "$ST_RUN")
+        if [ -n "$ST_ENUMERATE" ]; then args+=(--enumerate "$ST_ENUMERATE"); fi
+        if [ "$ST_FAIL_ON_DRIFT" = "true" ]; then args+=(--fail-on-drift); fi
         if [ -n "$ST_SEPARATOR" ]; then args+=(--separator "$ST_SEPARATOR"); fi
         if [ -n "$ST_UNITS_FILE" ]; then args+=(--units-file "$ST_UNITS_FILE"); fi
         shard-tests "${args[@]}"
