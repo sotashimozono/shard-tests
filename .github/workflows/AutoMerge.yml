@@ -1,0 +1,27 @@
+name: AutoMerge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    # GitHub's auto-merge waits only for what branch protection requires. With no
+    # required status checks it would merge as soon as the pull request is
+    # mergeable — that is, before CI has finished, red or not. The required checks
+    # configured on `main` are what make enabling it here safe; do not remove them
+    # without also removing this.
+    runs-on: ubuntu-latest
+    if: >
+      github.event.pull_request.user.type == 'Bot' ||
+      contains(github.event.pull_request.labels.*.name, 'automerge')
+    steps:
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"
