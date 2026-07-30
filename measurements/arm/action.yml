@@ -1,0 +1,46 @@
+name: 'scaling measurement arm'
+description: 'One shard of one arm of the scaling measurement'
+
+inputs:
+  version:
+    description: 'shard-tests release to measure'
+    required: true
+  shards:
+    description: 'Shard count for this arm'
+    required: true
+  index:
+    description: 'This shard'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install shard-tests
+      shell: bash
+      env:
+        ST_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP}/shard-tests-bin"
+        mkdir -p "$dir"
+        curl -fsSL "https://github.com/sotashimozono/shard-tests/releases/download/${ST_VERSION}/shard-tests-x86_64-unknown-linux-musl.tar.gz" \
+          | tar xz -C "$dir"
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: Plan and run
+      shell: bash
+      env:
+        SHARDS: ${{ inputs.shards }}
+        INDEX: ${{ inputs.index }}
+      run: |
+        set -euo pipefail
+        # No plan artifact: the synthetic universe is deterministic and carries no
+        # timings, so every shard computes an identical plan locally. That also keeps
+        # a plan job out of the number being measured, which is what this arm wants —
+        # its cost is a separate question.
+        shard-tests plan \
+          --recipe synthetic --recipe-file measurements/synthetic.json \
+          --min-shards "$SHARDS" --max-shards "$SHARDS"
+        shard-tests run \
+          --recipe synthetic --recipe-file measurements/synthetic.json \
+          --index "$INDEX"
