@@ -26,6 +26,37 @@ use std::path::{Path, PathBuf};
 
 #[derive(Args)]
 pub struct PlanArgs {
+    /// Built-in recipe supplying the hooks. `shard-tests recipes` lists them.
+    ///
+    /// Anything passed explicitly wins over the recipe, so a preset is a default
+    /// rather than a wall — which is what keeps coverage flags and secrets
+    /// injectable without rewriting it.
+    #[arg(long)]
+    recipe: Option<String>,
+
+    /// A JSON array of recipes to look `--recipe` up in, instead of the built-ins.
+    #[arg(long)]
+    recipe_file: Option<PathBuf>,
+
+    /// Which runner's observations to balance from. Durations differ by platform
+    /// enough that mixing them balances neither.
+    #[arg(long)]
+    runner: Option<String>,
+
+    /// Observations to consider per unit, most recent first. 0 uses all of them.
+    #[arg(long, default_value_t = 5)]
+    keep: usize,
+
+    /// Passed to the hooks as `SHARD_TESTS_EXTRA`.
+    ///
+    /// Needed here and not only in `run`: a build hook that takes feature flags
+    /// builds something else without them, and the enumeration would then describe
+    /// a suite the shards never run.
+    ///
+    /// `allow_hyphen_values` because the value almost always starts with `--`.
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
+    extra: String,
+
     /// Shell snippet run once before enumeration: build, archive, codegen.
     ///
     /// Compiled languages need this — you cannot list test functions without
@@ -139,22 +170,44 @@ pub fn main(args: PlanArgs) -> Result<()> {
         );
     }
 
-    if let Some(prepare) = &args.prepare {
-        eprintln!("shard-tests: prepare");
-        hook::status(prepare, &[])?;
+    let recipe = match &args.recipe {
+        Some(name) => {
+            let r = crate::recipe::Recipe::find(name, args.recipe_file.as_deref())?;
+            r.announce();
+            Some(r)
+        }
+        None => None,
+    };
+    let recipe_of =
+        |pick: fn(&crate::recipe::Recipe) -> Option<String>| recipe.as_ref().and_then(pick);
+
+    let prepare = args
+        .prepare
+        .clone()
+        .or_else(|| recipe_of(|r| r.build.clone()));
+    let env: Vec<(&str, &str)> = vec![("SHARD_TESTS_EXTRA", args.extra.as_str())];
+
+    if let Some(prepare) = &prepare {
+        eprintln!("shard-tests: build");
+        hook::status("build", prepare, &env)?;
     }
 
     let timings = match &args.timings {
-        Some(path) => load_timings(path)?,
+        Some(path) => crate::timings::load_any(path, args.runner.as_deref(), args.keep)?,
         None => Default::default(),
     };
 
-    let ids = match (&args.enumerate, args.units_from_timings) {
+    let enumerate = args
+        .enumerate
+        .clone()
+        .or_else(|| recipe_of(|r| Some(r.enumerate.clone())));
+
+    let ids = match (&enumerate, args.units_from_timings) {
         (Some(hook), false) => {
             eprintln!("shard-tests: enumerate");
-            parse_units(&hook::capture(hook, &[])?)?
+            parse_units(&hook::capture("enumerate", hook, &env)?)?
         }
-        (None, true) => {
+        (_, true) => {
             if timings.is_empty() {
                 bail!("--units-from-timings needs --timings, and that file must not be empty");
             }
@@ -165,8 +218,9 @@ pub fn main(args: PlanArgs) -> Result<()> {
             );
             ids
         }
-        (None, false) => bail!("pass either --enumerate or --units-from-timings"),
-        (Some(_), true) => unreachable!("clap rejects both"),
+        (None, false) => bail!(
+            "no way to establish the universe: pass --recipe, --enumerate, or --units-from-timings"
+        ),
     };
 
     let units = build_units(&ids, &timings, args.default_seconds);
@@ -308,17 +362,6 @@ pub fn build_units(
             },
         })
         .collect()
-}
-
-fn load_timings(path: &Path) -> Result<std::collections::HashMap<String, f64>> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("could not read timings {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| {
-        format!(
-            "{} is not a JSON object mapping unit id to seconds",
-            path.display()
-        )
-    })
 }
 
 /// Longest-processing-time-first, ties broken by enumeration order so the result

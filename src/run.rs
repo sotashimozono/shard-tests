@@ -1,29 +1,40 @@
-//! The run phase: execute one shard's share.
+//! The run phase: execute one shard's share, and record what each unit took.
 //!
-//! Two modes, and the difference is where *membership* comes from.
+//! Two axes, independent of each other.
 //!
-//! Without `--enumerate` the shard takes the slice the plan already computed. The
-//! plan is then authoritative about which units exist, which means enumeration had
-//! to happen before the fan-out — serially in front of every shard.
+//! **Where membership comes from.** Without `--enumerate` the shard takes the slice
+//! the plan computed, so enumeration had to happen before the fan-out. With
+//! `--enumerate` the shard derives it from its own hydrated build; assignment is a
+//! deterministic function of (universe, durations, shard count), so the shards agree
+//! without coordinating and the plan may be built beside the build rather than in
+//! front of it. A unit the plan never predicted is then assigned by construction
+//! and reported as drift instead of being silently skipped.
 //!
-//! With `--enumerate` the shard derives membership itself, from its own hydrated
-//! build. Assignment is a deterministic function of (universe, durations, shard
-//! count), so every shard reaches the same partition without talking to any other,
-//! and the plan is demoted to what it can supply without a build: the shard count
-//! and the timings. Planning then runs *beside* the build instead of in front of
-//! it. The plan's universe becomes a prediction, and a unit the build has that the
-//! prediction lacked is still assigned and still runs — it is reported as drift,
-//! not silently dropped.
+//! **Where durations come from.** `Reported` runs the slice once and asks the recipe
+//! to turn the runner's own report into `unit<TAB>seconds`. `Measured` invokes the
+//! test hook once per unit and times it from the outside, which needs no knowledge
+//! of the runner at all and costs one process launch per unit.
 
 use crate::hook;
 use crate::plan::{self, Plan};
-use anyhow::{bail, Result};
+use crate::recipe::{Recipe, TimingMode};
+use crate::timings::{self, Record};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Args)]
 pub struct RunArgs {
+    /// Built-in recipe supplying the hooks. `shard-tests recipes` lists them.
+    #[arg(long)]
+    recipe: Option<String>,
+
+    /// A JSON array of recipes to look `--recipe` up in, instead of the built-ins.
+    #[arg(long)]
+    recipe_file: Option<PathBuf>,
+
     #[arg(long, default_value = "shard-tests-plan.json")]
     plan: PathBuf,
 
@@ -32,28 +43,55 @@ pub struct RunArgs {
     index: usize,
 
     /// Shell snippet executed with `SHARD_TESTS_UNITS` set to this shard's ids.
+    /// Overrides the recipe's.
     #[arg(long)]
-    run: String,
+    run: Option<String>,
 
     /// Shell snippet printing one unit id per line, evaluated in this shard.
     ///
-    /// Give this when the plan was made without a build — the universe it holds is
-    /// then a prediction, and this is what makes real membership authoritative.
-    /// Must be cheap: it runs once per shard. Listing from a hydrated build
-    /// artifact qualifies; compiling the suite again does not.
+    /// Give this when the plan was made without a build: it makes real membership
+    /// authoritative, so a unit the plan did not predict is assigned rather than
+    /// skipped. Must be cheap — listing from a hydrated artifact qualifies,
+    /// compiling the suite again does not.
     #[arg(long)]
     enumerate: Option<String>,
 
-    /// Treat any difference between the predicted and the real universe as an error.
+    /// Derive membership locally using the recipe's own enumerate hook.
+    ///
+    /// Opt-in rather than implied by `--recipe`: the static slice is the default,
+    /// and deriving locally is the choice that goes with a plan built beside the
+    /// build. Equivalent to passing the recipe's enumerate to `--enumerate`.
+    #[arg(long)]
+    derive: bool,
+
+    /// Treat any difference between the predicted and real universe as an error.
     #[arg(long)]
     fail_on_drift: bool,
 
-    /// String joining the unit ids in `SHARD_TESTS_UNITS`.
+    /// Append a timing record per unit here, as JSONL.
+    #[arg(long)]
+    timings_out: Option<PathBuf>,
+
+    /// Name recorded with each timing, and the one `plan --runner` selects on.
+    #[arg(long, default_value = "")]
+    runner: String,
+
+    /// Passed to the hooks as `SHARD_TESTS_EXTRA`.
     ///
-    /// Newline suits runners that read a file or a list; a space or comma suits
-    /// filter expressions built by string interpolation.
-    #[arg(long, default_value = "\n")]
-    separator: String,
+    /// The injection point that keeps a recipe from being a wall: coverage flags and
+    /// the like go here rather than into a rewritten recipe.
+    ///
+    /// `allow_hyphen_values` because the value almost always starts with `--`.
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
+    extra: String,
+
+    /// Where a `Reported` recipe writes its report, exposed as `SHARD_TESTS_REPORT`.
+    #[arg(long, default_value = "shard-tests-report.json")]
+    report_file: PathBuf,
+
+    /// String joining the unit ids in `SHARD_TESTS_UNITS`. Overrides the recipe's.
+    #[arg(long)]
+    separator: Option<String>,
 
     /// Also write the unit ids, one per line, to this path.
     #[arg(long)]
@@ -61,8 +99,41 @@ pub struct RunArgs {
 }
 
 pub fn main(args: RunArgs) -> Result<()> {
-    let plan = Plan::load(&args.plan)?;
+    let recipe = match &args.recipe {
+        Some(name) => {
+            let r = Recipe::find(name, args.recipe_file.as_deref())?;
+            r.announce();
+            Some(r)
+        }
+        None => None,
+    };
 
+    let test = args
+        .run
+        .clone()
+        .or_else(|| recipe.as_ref().map(|r| r.test.clone()))
+        .context("no test command: pass --recipe or --run")?;
+    let separator = args
+        .separator
+        .clone()
+        .or_else(|| recipe.as_ref().map(|r| r.separator.clone()))
+        .unwrap_or_else(|| "\n".to_string());
+    let enumerate = match (&args.enumerate, args.derive) {
+        (Some(hook), _) => Some(hook.clone()),
+        (None, true) => Some(
+            recipe
+                .as_ref()
+                .map(|r| r.enumerate.clone())
+                .context("--derive needs --recipe, or pass --enumerate directly")?,
+        ),
+        (None, false) => None,
+    };
+    let mode = recipe
+        .as_ref()
+        .map(|r| r.timing_mode)
+        .unwrap_or(TimingMode::Reported);
+
+    let plan = Plan::load(&args.plan)?;
     if args.index == 0 || args.index > plan.shards {
         bail!(
             "--index {} is outside the planned range 1..={}",
@@ -71,13 +142,13 @@ pub fn main(args: RunArgs) -> Result<()> {
         );
     }
 
-    let (units, predicted_seconds) = match &args.enumerate {
+    let (units, predicted) = match &enumerate {
         None => static_slice(&plan, args.index),
         Some(hook) => derived_slice(&plan, args.index, hook, args.fail_on_drift)?,
     };
 
-    // An empty shard is a legitimate outcome once the shard count is chosen from
-    // measured work rather than fixed in YAML, so it succeeds rather than fails.
+    // An empty shard is legitimate once the count comes from measured work rather
+    // than from a number in YAML, so it succeeds rather than fails.
     if units.is_empty() {
         eprintln!(
             "shard-tests: shard {}/{} has no units, nothing to run",
@@ -95,18 +166,136 @@ pub fn main(args: RunArgs) -> Result<()> {
         args.index,
         plan.shards,
         units.len(),
-        predicted_seconds
+        predicted
     );
 
-    let joined = units.join(&args.separator);
-    hook::status(
-        &args.run,
-        &[
-            ("SHARD_TESTS_UNITS", joined.as_str()),
-            ("SHARD_TESTS_INDEX", &args.index.to_string()),
-            ("SHARD_TESTS_TOTAL", &plan.shards.to_string()),
-        ],
-    )
+    let index = args.index.to_string();
+    let total = plan.shards.to_string();
+    let report_file = args.report_file.display().to_string();
+    let base: Vec<(&str, &str)> = vec![
+        ("SHARD_TESTS_INDEX", index.as_str()),
+        ("SHARD_TESTS_TOTAL", total.as_str()),
+        ("SHARD_TESTS_EXTRA", args.extra.as_str()),
+        ("SHARD_TESTS_REPORT", report_file.as_str()),
+    ];
+
+    let records = match mode {
+        TimingMode::Measured => run_measured(&test, &units, &base, &args.runner)?,
+        TimingMode::Reported => run_reported(
+            &test,
+            &units,
+            &separator,
+            &base,
+            recipe.as_ref(),
+            &args.runner,
+        )?,
+    };
+
+    if let Some(path) = &args.timings_out {
+        timings::append(path, &records)?;
+        eprintln!(
+            "shard-tests: recorded {} timing(s) to {}",
+            records.len(),
+            path.display()
+        );
+    }
+
+    let failed: Vec<&Record> = records.iter().filter(|r| r.outcome == "fail").collect();
+    if !failed.is_empty() {
+        for r in &failed {
+            eprintln!("  failed: {}", r.unit);
+        }
+        bail!("{} of {} unit(s) failed", failed.len(), records.len());
+    }
+    Ok(())
+}
+
+/// One invocation per unit, timed from the outside.
+///
+/// Every unit is attempted even after one fails: stopping early would leave the
+/// rest of the shard unmeasured and the rest of the failures unreported, and a
+/// partial picture is what makes a red shard expensive to diagnose.
+fn run_measured(
+    test: &str,
+    units: &[String],
+    base: &[(&str, &str)],
+    runner: &str,
+) -> Result<Vec<Record>> {
+    let mut records = Vec::with_capacity(units.len());
+    for (n, unit) in units.iter().enumerate() {
+        let mut env = base.to_vec();
+        env.push(("SHARD_TESTS_UNITS", unit.as_str()));
+        eprintln!("shard-tests: [{}/{}] {unit}", n + 1, units.len());
+
+        let started = Instant::now();
+        let outcome = match hook::status("test", test, &env) {
+            Ok(()) => "pass",
+            Err(_) => "fail",
+        };
+        let seconds = started.elapsed().as_secs_f64();
+        records.push(Record::new(unit.clone(), seconds, outcome, runner));
+    }
+    Ok(records)
+}
+
+/// One invocation for the whole slice, then the recipe turns its report into
+/// `unit<TAB>seconds`.
+fn run_reported(
+    test: &str,
+    units: &[String],
+    separator: &str,
+    base: &[(&str, &str)],
+    recipe: Option<&Recipe>,
+    runner: &str,
+) -> Result<Vec<Record>> {
+    let joined = units.join(separator);
+    let mut env = base.to_vec();
+    env.push(("SHARD_TESTS_UNITS", joined.as_str()));
+
+    let outcome = hook::status("test", test, &env);
+
+    let report = match recipe.and_then(|r| r.report.clone()) {
+        Some(hook) => hook,
+        None => {
+            // No report hook, so nothing can be recorded — but the test result still
+            // has to be honoured.
+            outcome?;
+            return Ok(Vec::new());
+        }
+    };
+
+    // Read the report even when the tests failed: the durations of what did run are
+    // still the best estimate available, and discarding them would make a red run
+    // silently degrade the next plan's balance.
+    let parsed = match hook::capture("report", &report, &env) {
+        Ok(text) => parse_report(&text, runner),
+        Err(e) => {
+            eprintln!("shard-tests: could not read the timing report ({e})");
+            Vec::new()
+        }
+    };
+    outcome?;
+    Ok(parsed)
+}
+
+/// Parses `unit<TAB>seconds`, ignoring lines that are not that.
+fn parse_report(text: &str, runner: &str) -> Vec<Record> {
+    let mut records = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let (Some(unit), Some(seconds)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let unit = unit.trim();
+        if unit.is_empty() {
+            continue;
+        }
+        match seconds.trim().parse::<f64>() {
+            Ok(seconds) => records.push(Record::new(unit.to_string(), seconds, "pass", runner)),
+            Err(_) => eprintln!("shard-tests: report line has a non-numeric duration: {line}"),
+        }
+    }
+    records
 }
 
 /// The slice the plan computed, for suites whose enumeration happened up front.
@@ -125,12 +314,12 @@ fn derived_slice(
     fail_on_drift: bool,
 ) -> Result<(Vec<String>, f64)> {
     eprintln!("shard-tests: enumerate (membership from this shard's build)");
-    let real = plan::parse_units(&hook::capture(hook_script, &[])?)?;
+    let real = plan::parse_units(&hook::capture("enumerate", hook_script, &[])?)?;
 
     // Only genuinely measured entries become timings again: a unit the plan fell
-    // back to `default_seconds` for was never measured, and re-reading it as a
+    // back to `default_seconds` for was never measured, and reading it back as a
     // measurement would make the durations disagree with what a fresh plan would
-    // compute for the same inputs.
+    // compute from the same inputs.
     let timings = plan
         .units
         .iter()

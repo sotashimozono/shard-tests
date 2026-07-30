@@ -1,2 +1,5 @@
 /target
 shard-tests-plan.json
+shard-tests-map.tsv
+shard-tests-timings.jsonl
+shard-tests-report.json

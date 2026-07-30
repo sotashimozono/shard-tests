@@ -58,6 +58,10 @@ jobs:
         run: |
           jq -r '.units[].id' shard-tests-plan.json | sort > canonical.txt
           cat ran-*.txt | sort > ran.txt
+          # Assert non-empty first: `diff` of two empty files succeeds, so a run that
+          # produced nothing at all would otherwise read as a clean pass.
+          test -s canonical.txt && test -s ran.txt
+          echo "$(wc -l < canonical.txt) units"
           diff canonical.txt ran.txt
 
   dogfood-derived:
@@ -100,6 +104,8 @@ jobs:
         run: |
           sort real.txt > want.txt
           cat derived-*.txt | sort > got.txt
+          test -s want.txt && test -s got.txt
+          echo "$(wc -l < want.txt) units"
           diff want.txt got.txt
           # And the unpredicted unit is owned by exactly one shard, not zero, not two.
           # `grep -l` rather than `grep -c`: with a single shard file `-c` prints a bare
@@ -107,3 +113,44 @@ jobs:
           owners=$(grep -l -x -F "$(tail -1 real.txt)" derived-*.txt | wc -l)
           echo "unpredicted unit is owned by $owners shard(s)"
           test "$owners" = "1"
+
+  dogfood-recipe:
+    # Guards the recipe table and the timing loop together: plan from a built-in
+    # recipe, record what each unit took, merge it, and replan. The second plan
+    # must report 100% measured — if the ids the recipe enumerates and the ids it
+    # records ever drift apart, that number silently falls instead of failing, so
+    # it is asserted rather than eyeballed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+
+      - name: Plan from the recipe
+        id: plan
+        run: ./target/release/shard-tests plan --recipe cargo-test-binaries --target-seconds 1 --max-shards 2
+
+      - name: Run every shard, recording durations
+        env:
+          SHARDS: ${{ steps.plan.outputs.shards }}
+        run: |
+          for i in $(seq 1 "$SHARDS"); do
+            ./target/release/shard-tests run --recipe cargo-test-binaries --index "$i" \
+              --runner ubuntu-latest --timings-out "shard-$i.jsonl"
+          done
+
+      - name: Merge into the store
+        run: |
+          jq -r '.units[].id' shard-tests-plan.json > universe.txt
+          ./target/release/shard-tests finalize shard-*.jsonl \
+            --store timings.jsonl --universe universe.txt
+          test -s timings.jsonl
+          echo "records: $(wc -l < timings.jsonl)"
+
+      - name: Replanning from the store is fully measured
+        run: |
+          ./target/release/shard-tests plan --recipe cargo-test-binaries \
+            --timings timings.jsonl --runner ubuntu-latest --target-seconds 1 --max-shards 2
+          echo "measured_fraction=$(jq -r '.measured_fraction' shard-tests-plan.json)"
+          # Compared numerically, not as a string: jq 1.6 renders 1.0 as "1" while
+          # 1.7 keeps "1.0", so a string test passes or fails by runner image.
+          jq -e '.measured_fraction == 1' shard-tests-plan.json > /dev/null

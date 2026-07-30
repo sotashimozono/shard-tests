@@ -6,6 +6,20 @@ branding:
   color: 'purple'
 
 inputs:
+  recipe:
+    description: 'Built-in recipe supplying the hooks. `shard-tests recipes` lists them.'
+    required: false
+    default: ''
+  extra:
+    description: >
+      Passed to the hooks as $SHARD_TESTS_EXTRA. The injection point that keeps a recipe from
+      being a wall: coverage or feature flags go here rather than into a rewritten recipe.
+    required: false
+    default: ''
+  runner:
+    description: 'Which runner name to balance from, when the timings store holds several'
+    required: false
+    default: ''
   enumerate:
     description: 'Shell snippet printing one unit id per line on stdout. Omit when using units-from-timings.'
     required: false
@@ -46,7 +60,7 @@ inputs:
   version:
     description: 'shard-tests release to download'
     required: false
-    default: 'v0.1.2'
+    default: 'v0.1.4'
 
 outputs:
   matrix:
@@ -94,6 +108,9 @@ runs:
       # this script: `${{ inputs.enumerate }}` inline would let a recipe — or
       # anything that can influence one — run as part of the action itself.
       env:
+        ST_RECIPE: ${{ inputs.recipe }}
+        ST_EXTRA: ${{ inputs.extra }}
+        ST_RUNNER: ${{ inputs.runner }}
         ST_ENUMERATE: ${{ inputs.enumerate }}
         ST_FROM_TIMINGS: ${{ inputs.units-from-timings }}
         ST_PREPARE: ${{ inputs.prepare }}
@@ -115,4 +132,7 @@ runs:
         if [ "$ST_FROM_TIMINGS" = "true" ]; then args+=(--units-from-timings); fi
         if [ -n "$ST_PREPARE" ]; then args+=(--prepare "$ST_PREPARE"); fi
         if [ -n "$ST_TIMINGS" ]; then args+=(--timings "$ST_TIMINGS"); fi
+        if [ -n "$ST_RECIPE" ]; then args+=(--recipe "$ST_RECIPE"); fi
+        if [ -n "$ST_EXTRA" ]; then args+=(--extra "$ST_EXTRA"); fi
+        if [ -n "$ST_RUNNER" ]; then args+=(--runner "$ST_RUNNER"); fi
         shard-tests "${args[@]}"

@@ -6,12 +6,37 @@ branding:
   color: 'purple'
 
 inputs:
+  recipe:
+    description: 'Built-in recipe supplying the hooks. `shard-tests recipes` lists them.'
+    required: false
+    default: ''
+  extra:
+    description: 'Passed to the hooks as $SHARD_TESTS_EXTRA (coverage or feature flags)'
+    required: false
+    default: ''
+  runner:
+    description: 'Name recorded with each timing, and the one plan --runner selects on'
+    required: false
+    default: ''
+  timings-out:
+    description: 'Append a timing record per unit here, as JSONL'
+    required: false
+    default: ''
+  derive:
+    description: >
+      Derive membership from this shard's own build using the recipe's enumerate hook. Needed
+      when the plan was made with units-from-timings, so a unit it did not predict still runs.
+    required: false
+    default: 'false'
   index:
     description: '1-based shard index, i.e. the matrix value from the plan job'
     required: true
   run:
-    description: 'Shell snippet executed with SHARD_TESTS_UNITS set to this shard''s ids'
-    required: true
+    description: >
+      Shell snippet executed with SHARD_TESTS_UNITS set to this shard's ids. Optional when a
+      recipe supplies one; given here it overrides the recipe's.
+    required: false
+    default: ''
   enumerate:
     description: >
       Shell snippet printing one unit id per line, evaluated in this shard. Give this when the
@@ -39,7 +64,7 @@ inputs:
   version:
     description: 'shard-tests release to download'
     required: false
-    default: 'v0.1.2'
+    default: 'v0.1.4'
 
 runs:
   using: composite
@@ -74,6 +99,11 @@ runs:
       # See the note in the plan action: recipes go through the environment so
       # they are never interpolated into this script.
       env:
+        ST_DERIVE: ${{ inputs.derive }}
+        ST_RECIPE: ${{ inputs.recipe }}
+        ST_EXTRA: ${{ inputs.extra }}
+        ST_RUNNER: ${{ inputs.runner }}
+        ST_TIMINGS_OUT: ${{ inputs.timings-out }}
         ST_RUN: ${{ inputs.run }}
         ST_PLAN: ${{ inputs.plan }}
         ST_INDEX: ${{ inputs.index }}
@@ -83,9 +113,17 @@ runs:
         ST_UNITS_FILE: ${{ inputs.units-file }}
       run: |
         set -euo pipefail
-        args=(run --plan "$ST_PLAN" --index "$ST_INDEX" --run "$ST_RUN")
+        args=(run --plan "$ST_PLAN" --index "$ST_INDEX")
+        # Conditional: passing an empty --run would override the recipe's test
+        # command with nothing, which fails in a way that looks like a recipe bug.
+        if [ -n "$ST_RUN" ]; then args+=(--run "$ST_RUN"); fi
         if [ -n "$ST_ENUMERATE" ]; then args+=(--enumerate "$ST_ENUMERATE"); fi
         if [ "$ST_FAIL_ON_DRIFT" = "true" ]; then args+=(--fail-on-drift); fi
         if [ -n "$ST_SEPARATOR" ]; then args+=(--separator "$ST_SEPARATOR"); fi
         if [ -n "$ST_UNITS_FILE" ]; then args+=(--units-file "$ST_UNITS_FILE"); fi
+        if [ -n "$ST_RECIPE" ]; then args+=(--recipe "$ST_RECIPE"); fi
+        if [ -n "$ST_EXTRA" ]; then args+=(--extra "$ST_EXTRA"); fi
+        if [ -n "$ST_RUNNER" ]; then args+=(--runner "$ST_RUNNER"); fi
+        if [ -n "$ST_TIMINGS_OUT" ]; then args+=(--timings-out "$ST_TIMINGS_OUT"); fi
+        if [ "$ST_DERIVE" = "true" ]; then args+=(--derive); fi
         shard-tests "${args[@]}"
