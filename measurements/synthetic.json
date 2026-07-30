@@ -9,5 +9,16 @@
     "timing_mode": "measured",
     "verified": null,
     "notes": "Not a real recipe. 40 units of 3s each, so the workload is uniform and known and what is left to vary is the scheduling. Used by the scaling measurement for issue #4; balancing is uninteresting here on purpose, because a suite's own imbalance would be indistinguishable from the effect being measured."
+  },
+  {
+    "name": "synthetic-small",
+    "enumerate": "seq -w 1 12 | sed 's/^/unit-/'",
+    "test": "sleep 1",
+    "separator": "\n",
+    "enumerate_needs_build": false,
+    "transfers": [],
+    "timing_mode": "measured",
+    "verified": null,
+    "notes": "Twelve units of 1s. Used by the claim test, where what is being checked is that every unit is executed exactly once across shards that never talk to each other \u2014 not how long anything takes."
   }
 ]

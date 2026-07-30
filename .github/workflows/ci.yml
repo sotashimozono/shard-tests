@@ -233,3 +233,78 @@ jobs:
           test -s timings.jsonl
           echo "records: $(wc -l < timings.jsonl)"
           jq -e '.unit and .seconds and .runner == "ubuntu-latest"' timings.jsonl > /dev/null
+
+  # ── Claim-time assignment ────────────────────────────────────────────────────
+  #
+  # The property under test is exactly-once across shards that never talk to each
+  # other: twelve units, six shards, each taking work when it is free. If ref
+  # creation were not a compare-and-swap, or the chunking could hand the same unit
+  # out twice, the union below would not be the universe.
+  claim:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+      - name: Plan, identically in every shard
+        run: |
+          ./target/release/shard-tests plan \
+            --recipe synthetic-small --recipe-file measurements/synthetic.json \
+            --min-shards 6 --max-shards 6
+      - name: Claim and run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./target/release/shard-tests run --claim \
+            --recipe synthetic-small --recipe-file measurements/synthetic.json \
+            --index ${{ matrix.index }} --runner ubuntu-latest \
+            --timings-out claimed-${{ matrix.index }}.jsonl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: claim-records-${{ matrix.index }}
+          path: claimed-${{ matrix.index }}.jsonl
+          if-no-files-found: ignore
+          retention-days: 1
+
+  claim-verify:
+    needs: claim
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: claim-records-*
+          path: records
+          merge-multiple: true
+      - name: Every unit ran exactly once, across shards that never coordinated
+        run: |
+          set -euo pipefail
+          cat records/*.jsonl | jq -r .unit | sort > ran.txt
+          seq -w 1 12 | sed 's/^/unit-/' | sort > want.txt
+          test -s ran.txt && test -s want.txt
+          echo "units executed: $(wc -l < ran.txt)"
+          diff want.txt ran.txt
+          # Distribution is informational: how the work actually split is the point of
+          # claiming, but any split that covers the universe once is correct.
+          for f in records/*.jsonl; do echo "  $(basename "$f"): $(wc -l < "$f") unit(s)"; done
+      - name: Release the claims
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./target/release/shard-tests finalize records/*.jsonl \
+            --store /tmp/store.jsonl --drop-claims "${{ github.run_id }}"
+      - name: The namespace is empty again
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          left=$(gh api "repos/${{ github.repository }}/git/matching-refs/kleroterion/${{ github.run_id }}" --jq 'length')
+          echo "refs left: $left"
+          test "$left" = "0"

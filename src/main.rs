@@ -159,6 +159,13 @@ pub struct FinalizeArgs {
     /// so a deleted test stops counting toward the total that sets the shard count.
     #[arg(long)]
     universe: Option<PathBuf>,
+
+    /// Delete the claim refs of this run id.
+    ///
+    /// Claims are worthless once the run is over and nothing else removes them, so
+    /// without this the namespace grows by a ref per unit per run forever.
+    #[arg(long)]
+    drop_claims: Option<String>,
 }
 
 fn finalize(args: FinalizeArgs) -> Result<()> {
@@ -203,6 +210,15 @@ fn finalize(args: FinalizeArgs) -> Result<()> {
         "shard-tests: {before} stored + {gathered} new -> {} kept ({dropped} trimmed or retired)",
         compacted.len()
     );
+
+    if let Some(run_id) = &args.drop_claims {
+        match claim::Claimer::from_env(run_id).and_then(|c| c.drop_all()) {
+            Ok(n) => eprintln!("shard-tests: released {n} claim(s) of run {run_id}"),
+            // Never fatal: the timings are merged by this point, and leaving refs
+            // behind is untidy rather than wrong.
+            Err(e) => eprintln!("shard-tests: could not release the claims of run {run_id}: {e}"),
+        }
+    }
     Ok(())
 }
 

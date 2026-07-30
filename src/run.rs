@@ -15,6 +15,7 @@
 //! test hook once per unit and times it from the outside, which needs no knowledge
 //! of the runner at all and costs one process launch per unit.
 
+use crate::claim::{chunk_size, Claimer};
 use crate::hook;
 use crate::plan::{self, Plan};
 use crate::recipe::{Recipe, TimingMode};
@@ -63,6 +64,14 @@ pub struct RunArgs {
     /// build. Equivalent to passing the recipe's enumerate to `--enumerate`.
     #[arg(long)]
     derive: bool,
+
+    /// Take work when free instead of running a slice fixed at plan time.
+    ///
+    /// Falls back to the static slice, with a line saying so, when the job cannot
+    /// create refs — which is the case for a pull request from a fork. Needs
+    /// `SHARD_TESTS_TOKEN` or `GH_TOKEN`, and `contents: write`.
+    #[arg(long)]
+    claim: bool,
 
     /// Treat any difference between the predicted and real universe as an error.
     #[arg(long)]
@@ -179,16 +188,29 @@ pub fn main(args: RunArgs) -> Result<()> {
         ("SHARD_TESTS_REPORT", report_file.as_str()),
     ];
 
-    let records = match mode {
-        TimingMode::Measured => run_measured(&test, &units, &base, &args.runner)?,
-        TimingMode::Reported => run_reported(
-            &test,
-            &units,
-            &separator,
-            &base,
-            recipe.as_ref(),
-            &args.runner,
-        )?,
+    let execute = |batch: &[String]| -> Result<Vec<Record>> {
+        match mode {
+            TimingMode::Measured => run_measured(&test, batch, &base, &args.runner),
+            TimingMode::Reported => run_reported(
+                &test,
+                batch,
+                &separator,
+                &base,
+                recipe.as_ref(),
+                &args.runner,
+            ),
+        }
+    };
+
+    let records = if args.claim {
+        match claim_loop(&plan, args.index, &execute)? {
+            Some(records) => records,
+            // No capability: run the static slice, which is the same work this shard
+            // would have done anyway. Not an error — it is most of open source.
+            None => execute(&units)?,
+        }
+    } else {
+        execute(&units)?
     };
 
     if let Some(path) = &args.timings_out {
@@ -384,4 +406,82 @@ fn report_drift(plan: &Plan, real: &[String], fail_on_drift: bool) -> Result<()>
          predicted total, so balance may be stale. Refresh the timings to settle it."
     );
     Ok(())
+}
+
+/// Takes work until the run's queue is empty, or reports that it cannot.
+///
+/// `Ok(None)` means the job has no capability to claim and the caller should run
+/// its static slice. That is a mode, not a failure: a pull request from a fork
+/// cannot create refs, and those are the majority of contributions to a public
+/// repository.
+fn claim_loop(
+    plan: &Plan,
+    index: usize,
+    execute: &dyn Fn(&[String]) -> Result<Vec<Record>>,
+) -> Result<Option<Vec<Record>>> {
+    let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into());
+    let claimer = match Claimer::from_env(&run_id) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("shard-tests: cannot claim ({e}); running the static slice instead");
+            return Ok(None);
+        }
+    };
+
+    if !claimer.can_claim()? {
+        eprintln!(
+            "shard-tests: this job cannot create refs, so it cannot claim — running the static \
+             slice instead. Expected on a pull request from a fork, where the token is read-only."
+        );
+        return Ok(None);
+    }
+
+    let mut records = Vec::new();
+    // Units this shard tried for and lost. Held locally because the refs listing is
+    // not instantaneous: without it a shard can re-offer for a unit it just lost and
+    // spin, since the listing has not caught up with the loss yet.
+    let mut lost: HashSet<usize> = HashSet::new();
+    let mut rounds = 0usize;
+
+    loop {
+        let taken = claimer.claimed()?;
+        let remaining: Vec<usize> = plan
+            .order
+            .iter()
+            .copied()
+            .filter(|i| !taken.contains(i) && !lost.contains(i))
+            .collect();
+        if remaining.is_empty() {
+            break;
+        }
+
+        let want = chunk_size(remaining.len(), plan.shards);
+        let mut mine = Vec::new();
+        for &unit in remaining.iter().take(want) {
+            if claimer.take(unit)? {
+                mine.push(unit);
+            } else {
+                lost.insert(unit);
+            }
+        }
+        rounds += 1;
+
+        if mine.is_empty() {
+            continue;
+        }
+
+        let ids: Vec<String> = mine.iter().map(|&i| plan.units[i].id.clone()).collect();
+        let seconds: f64 = mine.iter().map(|&i| plan.units[i].seconds).sum();
+        eprintln!(
+            "shard-tests: shard {index} claimed {} unit(s), {seconds:.1}s predicted (round {rounds})",
+            ids.len()
+        );
+        records.extend(execute(&ids)?);
+    }
+
+    eprintln!(
+        "shard-tests: shard {index} ran {} unit(s) over {rounds} round(s)",
+        records.len()
+    );
+    Ok(Some(records))
 }

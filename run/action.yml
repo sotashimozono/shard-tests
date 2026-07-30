@@ -63,6 +63,13 @@ inputs:
       listing from a hydrated build artifact qualifies, compiling the suite again does not.
     required: false
     default: ''
+  claim:
+    description: >
+      Take work when free instead of running a slice fixed at plan time. Falls back to the
+      static slice, with a line saying so, when the job cannot create refs — which is the case
+      for a pull request from a fork. Needs contents:write and a token in GH_TOKEN.
+    required: false
+    default: 'false'
   fail-on-drift:
     description: 'Treat any difference between the predicted and real universe as an error'
     required: false
@@ -82,7 +89,7 @@ inputs:
   version:
     description: 'shard-tests release to download'
     required: false
-    default: 'v0.1.5'
+    default: 'v0.1.10'
 
 runs:
   using: composite
@@ -132,6 +139,7 @@ runs:
       # they are never interpolated into this script.
       env:
         ST_DERIVE: ${{ inputs.derive }}
+        ST_CLAIM: ${{ inputs.claim }}
         ST_RECIPE: ${{ inputs.recipe }}
         ST_EXTRA: ${{ inputs.extra }}
         ST_RUNNER: ${{ inputs.runner }}
@@ -158,6 +166,7 @@ runs:
         if [ -n "$ST_RUNNER" ]; then args+=(--runner "$ST_RUNNER"); fi
         if [ -n "$ST_TIMINGS_OUT" ]; then args+=(--timings-out "$ST_TIMINGS_OUT"); fi
         if [ "$ST_DERIVE" = "true" ]; then args+=(--derive); fi
+        if [ "$ST_CLAIM" = "true" ]; then args+=(--claim); fi
         shard-tests "${args[@]}"
 
     - name: Hand the records to finalize

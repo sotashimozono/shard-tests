@@ -44,6 +44,13 @@ inputs:
       to keep every unit ever recorded.
     required: false
     default: ''
+  drop-claims:
+    description: >
+      Delete the claim refs of this run id. Claims are worthless once the run is over and
+      nothing else removes them, so leaving this empty grows the namespace by a ref per unit
+      per run, forever.
+    required: false
+    default: ''
   artifact:
     description: 'Upload the merged store under this name. Empty skips the upload.'
     required: false
@@ -51,7 +58,7 @@ inputs:
   version:
     description: 'shard-tests release to download'
     required: false
-    default: 'v0.1.5'
+    default: 'v0.1.10'
 
 outputs:
   store:
@@ -108,6 +115,8 @@ runs:
         ST_KEEP: ${{ inputs.keep }}
         ST_UNIVERSE: ${{ inputs.universe }}
         ST_RECORDS: ${{ runner.temp }}/shard-tests-records
+        ST_DROP_CLAIMS: ${{ inputs.drop-claims }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         # No records is not an error on its own — a run where every shard was empty is
@@ -121,6 +130,7 @@ runs:
         fi
         args=(finalize "${files[@]}" --store "$ST_STORE" --keep "$ST_KEEP")
         if [ -n "$ST_UNIVERSE" ]; then args+=(--universe "$ST_UNIVERSE"); fi
+        if [ -n "$ST_DROP_CLAIMS" ]; then args+=(--drop-claims "$ST_DROP_CLAIMS"); fi
         shard-tests "${args[@]}"
 
     - name: Publish the store
