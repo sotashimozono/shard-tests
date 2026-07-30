@@ -1,0 +1,97 @@
+name: Measure token constraints
+
+# Measurement for #2, not a gate. Every step records what happened and exits 0.
+#
+# What #1 needs to know is whether a job whose token cannot write `contents` can
+# still create a git ref, because ref creation is the compare-and-swap the claim
+# protocol is built on. A pull request from a fork is exactly that job, and it is
+# the dominant contribution path in open source.
+#
+# This reproduces the constraint with an explicit `permissions:` block rather than
+# with an actual fork, because a repository cannot be forked into the account that
+# owns it. What it therefore does NOT reproduce, and what stays unmeasured:
+#
+#   - secrets are absent on a fork pull request (well documented, not in doubt)
+#   - the Actions cache is scoped differently for a fork, which is a separate
+#     question from this one and is not answered here
+#
+# Run it with workflow_dispatch when the answer needs refreshing.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/measure-token-constraints.yml'
+
+jobs:
+  readonly:
+    name: token that cannot write contents
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Probe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          ref="refs/shard-tests/measure/readonly-${GITHUB_RUN_ID}"
+
+          create=$(gh api -X POST "repos/${GH_REPO}/git/refs" \
+            -f ref="$ref" -f sha="$SHA" --include 2>&1 | head -1 || true)
+          read_refs=$(gh api "repos/${GH_REPO}/git/matching-refs/heads/main" \
+            --jq 'length' 2>&1 | head -1 || true)
+
+          {
+            echo "## Token that cannot write \`contents\`"
+            echo
+            echo "| probe | result |"
+            echo "| --- | --- |"
+            echo "| create a ref (\`POST /git/refs\`) | \`${create}\` |"
+            echo "| read refs (\`GET /git/matching-refs\`) | \`${read_refs}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "create -> $create"
+          echo "read   -> $read_refs"
+
+  writable:
+    name: control, token that can write contents
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Probe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          ref="refs/shard-tests/measure/writable-${GITHUB_RUN_ID}"
+
+          create=$(gh api -X POST "repos/${GH_REPO}/git/refs" \
+            -f ref="$ref" -f sha="$SHA" --include 2>&1 | head -1 || true)
+
+          # The property the claim protocol rests on: a second creation of the same
+          # ref must lose. If this ever succeeds, ref creation is not a
+          # compare-and-swap and #1 needs a different primitive.
+          again=$(gh api -X POST "repos/${GH_REPO}/git/refs" \
+            -f ref="$ref" -f sha="$SHA" --include 2>&1 | head -1 || true)
+
+          gh api -X DELETE "repos/${GH_REPO}/git/${ref}" > /dev/null 2>&1 || true
+
+          {
+            echo "## Control: token that can write \`contents\`"
+            echo
+            echo "| probe | result |"
+            echo "| --- | --- |"
+            echo "| create a ref | \`${create}\` |"
+            echo "| create the *same* ref again | \`${again}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "create -> $create"
+          echo "again  -> $again"
