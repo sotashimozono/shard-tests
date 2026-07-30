@@ -10,6 +10,10 @@ and those labels are what group the release notes and resolve the next version.
 It also reads a conventional-commit prefix in the title — `feat:`, `fix:`,
 `perf:`, `docs:`, `chore:`, `refactor:`, `ci:`, `test:`, or `!:` for breaking —
 so a title in that form labels the pull request even with nothing ticked.
+
+Do NOT tick a box the title prefix already covers. Release Drafter lists an entry
+under every category whose label matches, so two labels put the same pull request
+in the changelog twice.
 -->
 
 - [ ] New feature (`enhancement`)

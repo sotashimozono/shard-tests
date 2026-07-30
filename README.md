@@ -114,43 +114,36 @@ suite size requires it. It also buys two things worth having: enumeration happen
 a divergence between shards cannot hide as a silently missing unit, and a broken recipe
 fails one job instead of N.
 
-## When the build dominates: plan beside it, not in front of it
+## If your suite has to be built first
 
-For a compiled suite, `enumerate` needs the build — which would put the build in front of
-the fan-out. Measured on a Rust workspace of 799 tests, the test job was ~92s of compiling
-and ~75s of execution, so that ordering decides most of the wall clock.
-
-The second topology splits the two apart:
+`enumerate` normally needs the build, which puts the build in front of the fan-out. To build
+once and split only the execution, plan from timings instead and let each shard enumerate:
 
 ```
-job build:  cargo nextest archive → artifact   ─┐
-                                                ├→ N shards: hydrate, run their slice
-job plan:   shard-tests plan --units-from-timings ┘   ← concurrent with the build
+job build:  build once → artifact                 ─┐
+                                                   ├→ N shards: hydrate, run their slice
+job plan:   plan --units-from-timings              ┘   ← concurrent with the build
 ```
-
-`--units-from-timings` takes the universe from a previous run's measurements, so planning
-needs no build at all. That makes the universe a **prediction** — and a prediction alone
-would put a newly added test in no shard, where it silently never runs. So pair it with
-`run --enumerate`:
 
 ```yaml
       - uses: sotashimozono/shard-tests/run@v1
         with:
           index: ${{ matrix.index }}
-          enumerate: cargo nextest list --archive-file t.tar.zst --message-format json | jq -r '…'
-          run: cargo nextest run --archive-file t.tar.zst -E "$SHARD_TESTS_UNITS"
+          enumerate: <list from the hydrated artifact>
+          run: <run this shard's units>
 ```
 
-Each shard then derives membership from **its own hydrated build**. Assignment is a
-deterministic function of (universe, durations, shard count), so every shard reaches the
-same partition without talking to any other — a unit runs exactly once, and one the plan
-never predicted is assigned by construction rather than lost. The difference between the
-predicted and the real universe is reported as drift: nothing is dropped, but a large drift
-means the shard count came from a stale total and the timings want refreshing.
+`--units-from-timings` needs no build, so planning runs beside one. Its universe is only a
+**prediction**, so pair it with `run --enumerate`: each shard derives membership from its own
+artifact, and because assignment is a deterministic function of (universe, durations, shard
+count) the shards reach the same partition without coordinating. A unit runs exactly once,
+and one the plan never predicted is assigned rather than silently skipped — the difference is
+reported as drift. Large drift means the shard count came from a stale total; refresh the
+timings.
 
-Note the honest gap: nothing here records timings for you yet
-([#3](https://github.com/sotashimozono/shard-tests/issues/3)). Until it does, `--timings`
-wants a `{"unit id": seconds}` file you produce from whatever your runner already reports.
+Nothing records timings for you yet
+([#3](https://github.com/sotashimozono/shard-tests/issues/3)). `--timings` wants a
+`{"unit id": seconds}` file produced from whatever your runner already reports.
 
 ## Prior art, honestly
 
