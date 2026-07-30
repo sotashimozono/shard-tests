@@ -1,0 +1,120 @@
+name: Release
+
+# Detect a version bump on main, cut the tag, adopt Release Drafter's draft, and
+# upload prebuilt binaries — as ordered jobs in ONE workflow.
+#
+# Deliberately not split into "AutoTag pushes a tag" plus "a tag-triggered
+# workflow reacts": a tag created with GITHUB_TOKEN does not raise a tag-push
+# event, so the second workflow would never start and the release would silently
+# never happen. Keeping it in one run removes that trap and the personal access
+# token that working around it would need.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag to (re)publish, e.g. v0.1.1'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      release: ${{ steps.resolve.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the tag and cut it if new
+        id: resolve
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DISPATCH_TAG" ]; then
+            # An explicit dispatch means "publish this tag", even if it exists.
+            echo "tag=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "dispatched for $DISPATCH_TAG"
+            exit 0
+          fi
+
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          TAG="v$VERSION"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "$TAG already exists; this push did not bump the version"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "cut $TAG"
+          fi
+
+  release:
+    needs: tag
+    if: needs.tag.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release, or adopt the draft Release Drafter left
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Release Drafter keeps a draft whose tag is the next resolved version.
+          # Creating a second release for that same tag is the collision this
+          # ordering exists to avoid, so adopt the draft instead — and do not pass
+          # --notes, which would discard the changelog it accumulated.
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --draft=false
+            echo "adopted the existing release for $TAG"
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes
+            echo "created $TAG with generated notes"
+          fi
+
+  upload:
+    needs: [tag, release]
+    # The action downloads a prebuilt binary rather than building at consume time.
+    # That is load-bearing: it runs once per shard plus once for the plan, so its
+    # own startup is multiplied by the shard count. A Docker action's image pull,
+    # or a build, would dominate the very overhead this project exists to cut.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.tag.outputs.tag }}
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: shard-tests
+          target: ${{ matrix.target }}
+          archive: $bin-$target
+          ref: refs/tags/${{ needs.tag.outputs.tag }}
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,42 @@
+name: Release Drafter
+
+# Keeps a draft release for the next version, accumulating merged pull requests
+# grouped by the labels PRLabeler applies. `Release.yml` adopts that draft when
+# the tag is cut, instead of creating a second release for the same tag.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+
+jobs:
+  update_release_draft:
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the version from Cargo.toml
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $VERSION"
+
+      - uses: release-drafter/release-drafter@v7
+        with:
+          commitish: main
+          # Passed explicitly because Cargo.toml is authoritative here: left to
+          # resolve the version itself, Release Drafter counts up from the last
+          # published release and drifts away from the manifest — a fresh repo at
+          # 0.1.1 got a draft tagged v0.0.1. The drift is not cosmetic: `Release.yml`
+          # looks the draft up *by tag* to adopt its changelog, so a mismatched
+          # draft is silently abandoned and accumulates forever.
+          version: ${{ steps.version.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
