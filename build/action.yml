@@ -48,7 +48,7 @@ inputs:
   version:
     description: 'shard-tests release to download'
     required: false
-    default: 'v0.1.5'
+    default: 'v0.1.10'
 
 outputs:
   transfers:
