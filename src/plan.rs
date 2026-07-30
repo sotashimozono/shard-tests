@@ -181,10 +181,24 @@ pub fn main(args: PlanArgs) -> Result<()> {
     let recipe_of =
         |pick: fn(&crate::recipe::Recipe) -> Option<String>| recipe.as_ref().and_then(pick);
 
-    let prepare = args
-        .prepare
-        .clone()
-        .or_else(|| recipe_of(|r| r.build.clone()));
+    // A recipe's build is skipped when the universe is predicted from timings: this
+    // phase exists precisely so it can run *beside* the build, and running the
+    // build here would put it back in front of the fan-out — silently undoing the
+    // topology the caller asked for. An explicit --prepare still runs, because that
+    // is the caller saying they want it.
+    let prepare = match (args.units_from_timings, &args.prepare) {
+        (_, Some(explicit)) => Some(explicit.clone()),
+        (false, None) => recipe_of(|r| r.build.clone()),
+        (true, None) => {
+            if recipe_of(|r| r.build.clone()).is_some() {
+                eprintln!(
+                    "shard-tests: skipping the recipe's build — the universe comes from timings, \
+                     so this phase can run beside the build instead of after it"
+                );
+            }
+            None
+        }
+    };
     let env: Vec<(&str, &str)> = vec![("SHARD_TESTS_EXTRA", args.extra.as_str())];
 
     if let Some(prepare) = &prepare {

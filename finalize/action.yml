@@ -1,0 +1,132 @@
+name: 'shard-tests finalize'
+description: 'Merge what the shards recorded into the timings store'
+author: 'Sota Shimozono'
+branding:
+  icon: 'divide'
+  color: 'purple'
+
+# The one job that runs after the shards. It exists because a shard can only measure
+# its own units, so the observations arrive in pieces.
+#
+# Merging is a concatenation, not a reconciliation: the store is append-only JSONL, so
+# there is no ordering to get right and no conflict to resolve. What this step adds is
+# compaction — keeping the last few observations per unit and runner, and retiring
+# units the suite no longer has, which otherwise keep counting toward the total that
+# decides the shard count.
+#
+# Where the store lives between runs is deliberately not decided here: it takes and
+# leaves a path. A cache, an artifact, a committed file or a git ref all work, and a
+# ref has the property that a fork's pull request can read it although it cannot
+# write — which matches trunk being the only thing that should update it.
+
+inputs:
+  binary:
+    description: >
+      Use this shard-tests binary instead of downloading a release. Lets a repository test the
+      actions against a build of its own, and covers platforms with no published archive.
+    required: false
+    default: ''
+  pattern:
+    description: 'Artifact name pattern the shards uploaded their records under'
+    required: false
+    default: 'shard-tests-timings-*'
+  store:
+    description: 'Store to merge into and rewrite'
+    required: false
+    default: 'shard-tests-timings.jsonl'
+  keep:
+    description: 'Observations to keep per unit and runner. 0 keeps everything.'
+    required: false
+    default: '5'
+  universe:
+    description: >
+      A file of current unit ids, one per line. Units absent from it are retired. Leave empty
+      to keep every unit ever recorded.
+    required: false
+    default: ''
+  artifact:
+    description: 'Upload the merged store under this name. Empty skips the upload.'
+    required: false
+    default: 'shard-tests-timings'
+  version:
+    description: 'shard-tests release to download'
+    required: false
+    default: 'v0.1.5'
+
+outputs:
+  store:
+    description: 'Path to the merged store'
+    value: ${{ inputs.store }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install shard-tests
+      shell: bash
+      env:
+        ST_VERSION: ${{ inputs.version }}
+        ST_BINARY: ${{ inputs.binary }}
+      run: |
+        set -euo pipefail
+        dir="${RUNNER_TEMP}/shard-tests-bin"
+        mkdir -p "$dir"
+        if [ -n "${ST_BINARY:-}" ]; then
+          cp "$ST_BINARY" "$dir/shard-tests"
+          chmod +x "$dir/shard-tests"
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "shard-tests: using the supplied binary $ST_BINARY"
+          exit 0
+        fi
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)    target=x86_64-unknown-linux-musl ;;
+          Linux-ARM64)  target=aarch64-unknown-linux-musl ;;
+          macOS-X64)    target=x86_64-apple-darwin ;;
+          macOS-ARM64)  target=aarch64-apple-darwin ;;
+          Windows-X64)  target=x86_64-pc-windows-msvc ;;
+          *) echo "shard-tests: unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        base="https://github.com/sotashimozono/shard-tests/releases/download/${ST_VERSION}"
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          curl -fsSL "${base}/shard-tests-${target}.zip" -o "${dir}/shard-tests.zip"
+          unzip -q -o "${dir}/shard-tests.zip" -d "$dir"
+        else
+          curl -fsSL "${base}/shard-tests-${target}.tar.gz" | tar xz -C "$dir"
+        fi
+        echo "$dir" >> "$GITHUB_PATH"
+
+    - name: Collect what the shards recorded
+      uses: actions/download-artifact@v8
+      with:
+        pattern: ${{ inputs.pattern }}
+        path: ${{ runner.temp }}/shard-tests-records
+        merge-multiple: true
+
+    - name: Merge
+      shell: bash
+      env:
+        ST_STORE: ${{ inputs.store }}
+        ST_KEEP: ${{ inputs.keep }}
+        ST_UNIVERSE: ${{ inputs.universe }}
+        ST_RECORDS: ${{ runner.temp }}/shard-tests-records
+      run: |
+        set -euo pipefail
+        # No records is not an error on its own — a run where every shard was empty is
+        # legitimate — but it must be visible, because the usual cause is that the
+        # shards never passed timings-out and the store will never improve.
+        shopt -s nullglob
+        files=("$ST_RECORDS"/*.jsonl)
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "shard-tests: no timing records were uploaded — did the shards set timings-out?"
+          exit 0
+        fi
+        args=(finalize "${files[@]}" --store "$ST_STORE" --keep "$ST_KEEP")
+        if [ -n "$ST_UNIVERSE" ]; then args+=(--universe "$ST_UNIVERSE"); fi
+        shard-tests "${args[@]}"
+
+    - name: Publish the store
+      if: inputs.artifact != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact }}
+        path: ${{ inputs.store }}
+        if-no-files-found: ignore

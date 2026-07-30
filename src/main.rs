@@ -26,7 +26,7 @@ mod recipe;
 mod run;
 mod timings;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -39,6 +39,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the recipe's build once, and report what the shards must hydrate.
+    Build(BuildArgs),
     /// Enumerate the suite and write a plan: shard count, claim order, assignment.
     #[command(alias = "organize")]
     Plan(plan::PlanArgs),
@@ -51,6 +53,93 @@ enum Command {
     Recipes,
     /// Take the next unit from the run's queue. Not implemented yet.
     Claim(claim::ClaimArgs),
+}
+
+#[derive(Args)]
+pub struct BuildArgs {
+    /// Built-in recipe supplying the build command.
+    #[arg(long)]
+    recipe: Option<String>,
+
+    /// A JSON array of recipes to look `--recipe` up in, instead of the built-ins.
+    #[arg(long)]
+    recipe_file: Option<PathBuf>,
+
+    /// Build command, overriding the recipe's.
+    #[arg(long)]
+    build: Option<String>,
+
+    /// Passed to the hook as `SHARD_TESTS_EXTRA`.
+    #[arg(long, default_value = "", allow_hyphen_values = true)]
+    extra: String,
+}
+
+/// Runs the build phase alone, so it can be a job of its own and the plan can run
+/// beside it. Publishes the recipe's `transfers` as step outputs, so the caller
+/// uploads exactly what the shards need to hydrate without repeating the list.
+fn build(args: BuildArgs) -> Result<()> {
+    let recipe = match &args.recipe {
+        Some(name) => {
+            let r = recipe::Recipe::find(name, args.recipe_file.as_deref())?;
+            r.announce();
+            Some(r)
+        }
+        None => None,
+    };
+
+    let command = args
+        .build
+        .clone()
+        .or_else(|| recipe.as_ref().and_then(|r| r.build.clone()));
+
+    match &command {
+        Some(command) => {
+            eprintln!("shard-tests: build");
+            hook::status(
+                "build",
+                command,
+                &[("SHARD_TESTS_EXTRA", args.extra.as_str())],
+            )?;
+        }
+        None => eprintln!(
+            "shard-tests: this recipe has no build phase — every shard prepares its own \
+             environment instead, so there is nothing to hand over"
+        ),
+    }
+
+    let transfers: Vec<String> = recipe.map(|r| r.transfers).unwrap_or_default();
+    for path in &transfers {
+        if !std::path::Path::new(path).exists() {
+            bail!(
+                "the build finished but {path} is missing, and the shards are meant to hydrate \
+                 it — check the build command actually produced it"
+            );
+        }
+    }
+    emit_transfers(&transfers)
+}
+
+/// Publishes `transfers` and `has-transfers` as step outputs.
+fn emit_transfers(transfers: &[String]) -> Result<()> {
+    let block = format!(
+        "transfers<<SHARD_TESTS_EOF\n{}\nSHARD_TESTS_EOF\nhas-transfers={}\n",
+        transfers.join("\n"),
+        !transfers.is_empty()
+    );
+    match std::env::var_os("GITHUB_OUTPUT") {
+        Some(path) => {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)
+                .context("could not open $GITHUB_OUTPUT")?;
+            file.write_all(block.as_bytes())
+                .context("could not write to $GITHUB_OUTPUT")?;
+        }
+        None => print!("{block}"),
+    }
+    Ok(())
 }
 
 #[derive(Args)]
@@ -119,6 +208,7 @@ fn finalize(args: FinalizeArgs) -> Result<()> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Build(args) => build(args),
         Command::Plan(args) => plan::main(args),
         Command::Run(args) => run::main(args),
         Command::Finalize(args) => finalize(args),
