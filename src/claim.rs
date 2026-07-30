@@ -11,9 +11,15 @@
 //!
 //! So the best static shard count is the ceiling, and the ceiling is not knowable
 //! from a workflow file: it moves with the plan, the runner type, and whatever else
-//! the account is doing. Claiming removes the need to know it. Over-provision; the
-//! shards that start drain the queue, and the ones that start late take little or
-//! nothing.
+//! the account is doing. Claiming buys robustness to not knowing it.
+//!
+//! What it does **not** buy is free over-provisioning, which is what this module's
+//! comment used to say. Measured on the same 120s workload: static at N=8 is 27s,
+//! static at N=80 is 53s, claiming at N=80 is 42s. Claiming wins by 21% at the same
+//! shard count and is still worse than static at a *sensible* one, because a surplus
+//! shard is not free — it is scheduled anyway, occupies a slot anyway, and has to
+//! finish before the workflow does. Work redistribution is what this fixes;
+//! scheduling cost is not.
 //!
 //! The primitive is git ref creation, which is a compare-and-swap: measured, a
 //! second creation of the same ref loses with 422. It needs `contents: write`,
