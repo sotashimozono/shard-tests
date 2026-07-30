@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Covers `uses:` in the workflows and in both composite actions. Major tags are
+  # used deliberately (`@v7`, not `@v7.0.1`), so this only opens a pull request
+  # when a new major appears rather than on every patch.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
