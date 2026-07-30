@@ -1,0 +1,106 @@
+name: Measure claim vs static
+
+# The decisive comparison for #4, and for the claim the README makes: that
+# over-provisioning is only safe under claim-time assignment.
+#
+# Forty units of three seconds — 120s of work — handed to eighty shards, which is
+# well past the measured ceiling of about 31 concurrent. Static gives forty shards
+# one unit each and forty shards nothing, and the last of them cannot begin until a
+# slot frees. Claiming lets whoever is running take the queue, and the ones that
+# start late find it empty.
+#
+# The arms run in sequence. Run together they would each be waiting on the other's
+# jobs, and neither number would mean anything.
+#
+# Dispatch only: 160 jobs, and it saturates the hosted pool for a few minutes.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  static:
+    name: 'static'
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+      - name: Plan and run a fixed slice
+        run: |
+          ./target/release/shard-tests plan \
+            --recipe synthetic --recipe-file measurements/synthetic.json \
+            --min-shards 80 --max-shards 80
+          ./target/release/shard-tests run \
+            --recipe synthetic --recipe-file measurements/synthetic.json \
+            --index ${{ matrix.index }}
+
+  claim:
+    name: 'claim'
+    needs: static
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release
+      - name: Plan and take work when free
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./target/release/shard-tests plan \
+            --recipe synthetic --recipe-file measurements/synthetic.json \
+            --min-shards 80 --max-shards 80
+          ./target/release/shard-tests run --claim \
+            --recipe synthetic --recipe-file measurements/synthetic.json \
+            --index ${{ matrix.index }} --runner ubuntu-latest
+
+  collect:
+    needs: [static, claim]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GH_REPO}/actions/runs/${RUN}/jobs" \
+            --jq '[.jobs[] | select(.name | test("^(static|claim)")) | {name, started_at, completed_at}]' \
+            | jq -s 'add' > jobs.json
+          python3 - <<'PY2' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, datetime
+          def t(s): return datetime.datetime.fromisoformat(s.replace("Z","+00:00")).timestamp()
+          jobs=[j for j in json.load(open("jobs.json")) if j["started_at"] and j["completed_at"]]
+          arms={}
+          for j in jobs:
+              arms.setdefault(j["name"].split()[0], []).append(j)
+          print("## 40 units of 3s (120s of work) handed to 80 shards\n")
+          print("| arm | wall clock | start spread | jobs |")
+          print("| --- | --- | --- | --- |")
+          for name in ("static", "claim"):
+              js=arms.get(name, [])
+              if not js: continue
+              st=[t(j["started_at"]) for j in js]; en=[t(j["completed_at"]) for j in js]
+              print(f"| {name} | **{max(en)-min(st):.0f}s** | {max(st)-min(st):.0f}s | {len(js)} |")
+          PY2
+      - name: Release the claims
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/git/matching-refs/kleroterion/${{ github.run_id }}" \
+            --jq '.[].ref' | while read -r ref; do
+              gh api -X DELETE "repos/${{ github.repository }}/git/$ref" > /dev/null 2>&1 || true
+            done
+          echo "refs left: $(gh api "repos/${{ github.repository }}/git/matching-refs/kleroterion/${{ github.run_id }}" --jq 'length')"
