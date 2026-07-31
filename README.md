@@ -43,15 +43,35 @@ measured ~5s of per-job overhead:
 | claim, N=80 | **~10s** |
 
 If a shard instead takes its next units **at the moment it is free**, a late-starting shard
-takes fewer, or none. The sharp form of the argument is not that claiming recovers the
-stagger — it is that **the best static shard count is the ceiling, and the ceiling is not
-knowable from a workflow file.** It moves with the plan, the runner type, and whatever else
-the account is running. Claiming means not needing to know it.
+takes fewer, or none. Measured on the same workload, at 80 shards: **static 53s, claiming
+42s** — 21%.
 
-And when minutes are free, as they are for public repositories, that is the whole game:
-**you can over-provision, and over-provisioning is only safe under claim-time assignment.**
+### What claiming does not buy
 
-Below the ceiling none of this matters, and the static path is the right tool. Both ship.
+An earlier version of this README said you could therefore over-provision freely, and that
+over-provisioning was only safe under claim-time assignment. **This repository's own CI
+disproves that**, so here is the measurement instead:
+
+| N | policy | wall clock |
+| --- | --- | --- |
+| 8 | static | **27s** |
+| 80 | static | 53s |
+| 80 | claim | **42s** |
+
+At eighty shards, claiming is still worse than static assignment at eight. Claiming makes the
+*work* distribution optimal, but a surplus shard is not free: it is still scheduled, still
+occupies a slot, and still has to finish before the workflow does. Asking for far more shards
+than the ceiling costs wall clock under either policy.
+
+So, plainly:
+
+- **Pick a shard count near the ceiling.** `target-seconds` and `max-shards` are how, and
+  going far above it is a mistake claiming will not rescue.
+- **Claiming buys robustness**, not licence to over-provision — to not knowing exactly where
+  the ceiling is today, to timings that have drifted, to units that turn out uneven.
+- **Below the ceiling none of this matters at all**, and the static path is the right tool.
+
+Both paths ship, and neither is a fallback for the other.
 
 ## Claiming
 
